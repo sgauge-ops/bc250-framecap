@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+/// Averages available GPU usage samples over a sliding time window.
 pub(crate) struct GpuUsageSmoother {
     window: Duration,
     samples: VecDeque<(Instant, f32)>,
@@ -53,12 +54,14 @@ impl GpuUsageSmoother {
     }
 }
 
+/// Sliding time window of finite readings for a single sensor.
 struct SensorWindow {
     window: Duration,
     samples: VecDeque<(Instant, f32)>,
 }
 
 impl SensorWindow {
+    /// Creates an empty window that keeps samples for `window`.
     fn new(window: Duration) -> Self {
         Self {
             window,
@@ -66,6 +69,7 @@ impl SensorWindow {
         }
     }
 
+    /// Adds a reading and returns the window average; a missing or non-finite value clears the window.
     fn add(&mut self, timestamp: Instant, value: Option<f32>) -> Option<f32> {
         let Some(value) = value.filter(|value| value.is_finite()) else {
             self.samples.clear();
@@ -88,6 +92,7 @@ impl SensorWindow {
     }
 }
 
+/// Smooths each hardware sensor with its own rolling-average window.
 pub(crate) struct HardwareMetricsSmoother {
     cpu_temp_c: SensorWindow,
     gpu_vrm_temp_c: SensorWindow,
@@ -103,6 +108,7 @@ pub(crate) struct HardwareMetricsSmoother {
 }
 
 impl HardwareMetricsSmoother {
+    /// Creates a smoother whose sensors all average over `window`.
     pub(crate) fn new(window: Duration) -> Self {
         Self {
             cpu_temp_c: SensorWindow::new(window),
@@ -119,6 +125,7 @@ impl HardwareMetricsSmoother {
         }
     }
 
+    /// Returns `metrics` with each smoothed sensor replaced by its rolling average; other fields pass through.
     pub(crate) fn add(&mut self, metrics: HardwareMetrics, timestamp: Instant) -> HardwareMetrics {
         HardwareMetrics {
             cpu_temp_c: self.cpu_temp_c.add(timestamp, metrics.cpu_temp_c),
@@ -140,6 +147,7 @@ impl HardwareMetricsSmoother {
     }
 }
 
+/// Source of GPU usage measurements.
 pub trait GpuTelemetryProvider: Send + Sync {
     /// Reads the provider's latest GPU measurement.
     fn get_metric(&self) -> GpuMeasurement;
@@ -152,6 +160,7 @@ impl<T: GpuTelemetryProvider + ?Sized> GpuTelemetryProvider for Arc<T> {
     }
 }
 
+/// Provider returning a fixed GPU usage value, for tests and simulation.
 pub struct MockGpuProvider {
     pub mock_value: f32,
 }
@@ -272,6 +281,7 @@ impl GpuTelemetryProvider for AmdGpuProvider {
     }
 }
 
+/// Reads GTT and system RAM usage, logging only when a reading starts or stops failing.
 pub(crate) struct MemoryUsageProvider {
     gtt_device: Option<PathBuf>,
     meminfo: PathBuf,
@@ -281,6 +291,7 @@ pub(crate) struct MemoryUsageProvider {
 }
 
 impl MemoryUsageProvider {
+    /// Locates the GPU's sysfs device directory from its usage counter path and targets `/proc/meminfo`.
     pub(crate) fn new(gpu: &AmdGpuProvider) -> Self {
         Self {
             gtt_device: (!gpu.card_path.is_empty())
@@ -293,6 +304,7 @@ impl MemoryUsageProvider {
         }
     }
 
+    /// Fills the GTT used/total and RAM used fields (in MB), leaving `None` for unreadable ones.
     pub(crate) fn update(&mut self, metrics: &mut HardwareMetrics) {
         let gtt_value = |name| -> anyhow::Result<f32> {
             let directory = self
@@ -319,6 +331,7 @@ impl MemoryUsageProvider {
     }
 }
 
+/// Returns a reading's value, logging a warning on the first failure and a notice on recovery.
 fn report_memory_reading(
     name: &str,
     reading: anyhow::Result<f32>,
@@ -342,6 +355,7 @@ fn report_memory_reading(
     }
 }
 
+/// Computes used RAM in MB as `MemTotal - MemAvailable` from `/proc/meminfo`, rejecting malformed input.
 fn parse_ram_used_mb(contents: &str) -> anyhow::Result<f32> {
     let mut total = None;
     let mut available = None;
@@ -378,6 +392,7 @@ fn parse_ram_used_mb(contents: &str) -> anyhow::Result<f32> {
     Ok(bytes as f32 / 1_000_000.0)
 }
 
+/// Reads CPU/GPU temperatures, power and fan speed from resolved hwmon sysfs files.
 pub struct HwmonMetricsProvider {
     cpu_temp: Option<PathBuf>,
     gpu_vrm_temp: Option<PathBuf>,
@@ -419,10 +434,12 @@ impl HwmonMetricsProvider {
         )
     }
 
+    /// Builds a provider from the user's metrics settings, honouring explicit paths and device/label selectors.
     pub fn with_settings(settings: &MetricsSettings) -> Self {
         Self::from_root_with_settings(Path::new("/sys/class/hwmon"), settings)
     }
 
+    /// Same as `with_settings` but scans `root` instead of `/sys/class/hwmon`.
     fn from_root_with_settings(root: &Path, settings: &MetricsSettings) -> Self {
         let mut provider = Self::from_root_with_paths(
             root,
@@ -514,6 +531,7 @@ impl HwmonMetricsProvider {
         provider
     }
 
+    /// Resolves each sensor from its explicit path, else from well-known hwmon labels under `root`.
     fn from_root_with_paths(
         root: &Path,
         cpu_temp: Option<PathBuf>,
@@ -585,6 +603,7 @@ impl HwmonMetricsProvider {
     }
 }
 
+/// Finds the single sensor whose hwmon device name and label match `selector`; ambiguity or no match yields `None`.
 fn find_selected_sensor(
     root: &Path,
     sensor_type: &str,
@@ -674,6 +693,7 @@ fn find_selected_sensor(
     }
 }
 
+/// Returns `path` if it is a file, else its `_input` or `_average` variant if one exists.
 fn resolve_sensor_path(path: &Path) -> Option<PathBuf> {
     if path.is_file() {
         return Some(path.to_path_buf());
@@ -687,6 +707,7 @@ fn resolve_sensor_path(path: &Path) -> Option<PathBuf> {
     })
 }
 
+/// Finds the first hwmon sensor whose `<type>N_label` equals `label` and returns its `<type>N_<suffix>` file.
 fn find_labeled_sensor(
     directories: &[PathBuf],
     sensor_type: &str,
@@ -709,21 +730,25 @@ fn find_labeled_sensor(
     })
 }
 
+/// Reads a numeric sysfs value divided by `divisor`, or `None` if missing, unparsable or non-finite.
 fn read_hwmon_value(path: Option<&Path>, divisor: f32) -> Option<f32> {
     let value = fs::read_to_string(path?).ok()?.trim().parse::<f32>().ok()?;
     value.is_finite().then_some(value / divisor)
 }
 
+/// Computes CPU load from successive `/proc/stat` samples.
 pub(crate) struct CpuUsageProvider {
     proc_stat_path: PathBuf,
     previous: Option<(u64, u64)>,
 }
 
 impl CpuUsageProvider {
+    /// Creates a provider reading `/proc/stat`.
     pub(crate) fn new() -> Self {
         Self::from_path(PathBuf::from("/proc/stat"))
     }
 
+    /// Creates a provider with no previous sample, reading the given `/proc/stat` path.
     fn from_path(proc_stat_path: PathBuf) -> Self {
         Self {
             proc_stat_path,
@@ -746,6 +771,7 @@ impl CpuUsageProvider {
     }
 }
 
+/// Parses the aggregate `cpu` line of `/proc/stat` into `(total, idle)` jiffies; idle includes iowait.
 fn parse_cpu_stat(contents: &str) -> Option<(u64, u64)> {
     let mut fields = contents.lines().next()?.split_whitespace();
     if fields.next()? != "cpu" {

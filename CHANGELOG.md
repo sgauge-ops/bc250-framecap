@@ -8,6 +8,20 @@ changes, not necessarily when development originally took place.
 
 | Date | Changes |
 | --- | --- |
+| 2026-11-15 | Record bounded per-thread Vulkan submission, synchronization, acquisition and presentation traces during frametime capture. |
+| 2026-11-15 | Add an opt-in experimental post-presentation frame-cap wait and record its placement in frametime captures. |
+| 2026-11-15 | Calibrate GPU marker timestamps against the CPU monotonic clock asynchronously during frametime capture when Vulkan support is available. |
+| 2026-11-15 | Extend frametime capture to 30 seconds, correlate captured image acquisitions and application-provided presentation metadata, and show the frametime value in red while capture is active. |
+| 2026-11-15 | Replace the overlay jitter indicator and ASCII jitter graph with CPU frametime, without changing AUTO JIT regulation. |
+| 2026-11-15 | Record nonblocking GPU timestamp markers during frametime capture when the presentation queue and semaphores permit it. |
+| 2026-11-15 | Record Vulkan overlay commands before frame pacing for all renderers, checking deadlines after preparation; capture now distinguishes the preparation and metrics lock waits. |
+| 2026-11-15 | Prepare ASCII and Modern overlay layouts asynchronously. |
+| 2026-11-15 | Prepare Helix overlay layouts asynchronously, keeping the previous compatible layout while an update is pending. |
+| 2026-11-15 | Rebased the frame limiter's next deadline after a missed deadline, reducing catch-up pacing spikes. Other sources of frametime spikes remain possible. |
+| 2026-11-13 | Applied the `helix` panel origin consistently to its background, text, brackets and badges, with clipping and 2× fit accounting for the offset. |
+| 2026-11-13 | Grouped the `modern` renderer's colors into named palette constants, including a separate title color, without changing its appearance. |
+| 2026-11-12 | Added the `helix` overlay renderer (`[overlay].renderer = "helix"`): a flat monospace panel with teal corner brackets, numbered `01 // MODE`, `02 // SENSORS` and `03 // KEY BINDINGS` sections, a GTT segment bar and outlined key boxes, using bundled Fira Mono. Holding F8 now cycles through `ascii`, `modern` and `helix`. Text and rectangle batching moved to a shared `renderer/canvas.rs` used by `modern` and `helix`, with no change to `modern`. In `helix`, the mode badge is fully highlighted in AUTO, half-highlighted in MANUAL and not highlighted when OFF. |
+| 2026-11-12 | Split the overlay renderer into a `src/layer/renderer/` module with one file per visual model (`ascii`, `modern`) behind a common `OverlayModel` trait, so new models can be added without touching the shared Vulkan swapchain code. No behavior change. |
 | 2026-11-11 | Removed the standalone BC-250 memory probe; GDDR6 hotspot telemetry remains available in the overlay. |
 | 2026-11-11 | Included executable `test-vkcube.sh` and `test-furmark.sh` scripts in the Linux release archive. |
 | 2026-11-11 | Renamed `VK_LAYER_FRAMECAP_observability` to `VK_LAYER_BC250_framecap`; update `VK_INSTANCE_LAYERS` in launch options and scripts. |

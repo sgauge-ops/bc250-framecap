@@ -2,6 +2,7 @@ use crate::layer::auto::{adjust_auto_target, adjust_hysteresis};
 use crate::layer::config::{AutoMetric, Hotkey};
 use crate::layer::diagnostics;
 use crate::layer::limiter::FrameCapController;
+use crate::layer::persistence::{self, Change};
 use crate::layer::renderer::{
     OverlayFeedbackEvent, OverlayFeedbackState, OverlayModeState, OverlayRendererState,
 };
@@ -9,6 +10,7 @@ use libloading::Library;
 use parking_lot::Mutex;
 use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong};
 use std::mem::MaybeUninit;
+use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -29,6 +31,7 @@ const XK_CAPS_LOCK: c_ulong = 0xffe5;
 const XK_NUM_LOCK: c_ulong = 0xff7f;
 const XK_SCROLL_LOCK: c_ulong = 0xff14;
 
+/// Maps a configured hotkey to its X11 keysym.
 fn keysym(hotkey: Hotkey) -> c_ulong {
     match hotkey {
         Hotkey::F5 => XK_F5,
@@ -38,11 +41,13 @@ fn keysym(hotkey: Hotkey) -> c_ulong {
     }
 }
 
+/// Opaque Xlib `Display` connection handle.
 #[repr(C)]
 struct Display {
     _private: [u8; 0],
 }
 
+/// C-layout mirror of Xlib's `XKeyEvent`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct XKeyEvent {
@@ -63,6 +68,7 @@ struct XKeyEvent {
     same_screen: c_int,
 }
 
+/// C-layout mirror of Xlib's `XEvent` union, limited to key events and padded to its full size.
 #[repr(C)]
 #[derive(Clone, Copy)]
 union XEvent {
@@ -71,12 +77,14 @@ union XEvent {
     pad: [c_long; 24],
 }
 
+/// C-layout mirror of Xlib's `XModifierKeymap`, mapping each modifier to its keycodes.
 #[repr(C)]
 struct XModifierKeymap {
     max_keypermod: c_int,
     modifiermap: *mut u8,
 }
 
+/// Xlib function pointers resolved at runtime; the library stays loaded for their lifetime.
 struct X11 {
     _library: Library,
     init_threads: unsafe extern "C" fn() -> c_int,
@@ -217,6 +225,7 @@ impl X11 {
     }
 }
 
+/// Per-device state and shared controls that hotkey actions operate on.
 struct HotkeyTarget {
     controller: Arc<FrameCapController>,
     overlay_mode: Arc<OverlayModeState>,
@@ -225,27 +234,34 @@ struct HotkeyTarget {
     auto_hysteresis: Arc<Vec<AtomicU32>>,
     auto_targets: Arc<Vec<AtomicU64>>,
     auto_metrics: Vec<AutoMetric>,
+    auto_names: Vec<String>,
+    persistence_path: Option<PathBuf>,
     manual_step_fps: f32,
+    manual_fps: AtomicU32,
     overlay_feedback: Arc<OverlayFeedbackState>,
     hotkeys: [Hotkey; 4],
 }
 
+/// Handle to the process-wide listener thread and its stop flag.
 struct HotkeyListener {
     stop: Arc<AtomicBool>,
     worker: JoinHandle<()>,
 }
 
+/// Process-wide registry of weakly held targets plus the single shared listener.
 #[derive(Default)]
 struct HotkeyManager {
     targets: Vec<Weak<HotkeyTarget>>,
     listener: Option<HotkeyListener>,
 }
 
+/// Returns the lazily initialised process-wide hotkey manager.
 fn hotkey_manager() -> &'static Mutex<HotkeyManager> {
     static MANAGER: OnceLock<Mutex<HotkeyManager>> = OnceLock::new();
     MANAGER.get_or_init(|| Mutex::new(HotkeyManager::default()))
 }
 
+/// Registration of one device with the shared X11 hotkey listener; unregisters on drop.
 pub struct HotkeyWorker {
     target: Option<Arc<HotkeyTarget>>,
 }
@@ -265,7 +281,9 @@ impl HotkeyWorker {
         auto_hysteresis: Arc<Vec<AtomicU32>>,
         auto_targets: Arc<Vec<AtomicU64>>,
         auto_metrics: Vec<AutoMetric>,
+        auto_names: Vec<String>,
         manual_step_fps: f32,
+        initial_manual_fps: f32,
         overlay_feedback: Arc<OverlayFeedbackState>,
     ) -> Option<Self> {
         if !enabled {
@@ -280,7 +298,16 @@ impl HotkeyWorker {
             auto_hysteresis,
             auto_targets,
             auto_metrics,
+            auto_names,
+            persistence_path: match persistence::config_path() {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    diagnostics::error(format!("Unable to locate user configuration: {error}"));
+                    None
+                }
+            },
             manual_step_fps,
+            manual_fps: AtomicU32::new(initial_manual_fps.to_bits()),
             overlay_feedback,
             hotkeys: [auto_key, up_key, down_key, toggle_key],
         });
@@ -346,6 +373,7 @@ impl HotkeyWorker {
 }
 
 impl Drop for HotkeyWorker {
+    /// Unregisters the device from the listener.
     fn drop(&mut self) {
         self.stop();
     }
@@ -480,6 +508,7 @@ enum HotkeyEvent {
     LongPress,
 }
 
+/// Tracks a held key's X11 press time to detect long presses.
 #[derive(Clone, Copy)]
 struct PressedKey {
     x_time: u32,
@@ -488,6 +517,7 @@ struct PressedKey {
 }
 
 impl PressedKey {
+    /// Starts tracking a press with its X11 timestamp and local start time.
     fn new(x_time: u32, started_at: Instant) -> Self {
         Self {
             x_time,
@@ -496,6 +526,7 @@ impl PressedKey {
         }
     }
 
+    /// Returns true exactly once when the key has been held for the long-press duration.
     fn long_press_due(&mut self, now: Instant) -> bool {
         if !self.long_press_dispatched && now.duration_since(self.started_at) >= LONG_PRESS {
             self.long_press_dispatched = true;
@@ -505,6 +536,7 @@ impl PressedKey {
         }
     }
 
+    /// Classifies a release using X11 timestamps; yields nothing if the long press already fired.
     fn release(self, x_time: u32) -> Option<HotkeyEvent> {
         if self.long_press_dispatched {
             None
@@ -516,7 +548,17 @@ impl PressedKey {
     }
 }
 
+/// Dispatches a hotkey event, starting a real capture on an F5 long press.
 fn dispatch_hotkey(hotkey: Hotkey, event: HotkeyEvent) {
+    dispatch_hotkey_with(hotkey, event, crate::layer::capture::start);
+}
+
+/// Handles an F5 long press via `start_capture`; otherwise forwards the event to every live target.
+fn dispatch_hotkey_with(hotkey: Hotkey, event: HotkeyEvent, start_capture: impl FnOnce()) {
+    if hotkey == Hotkey::F5 && event == HotkeyEvent::LongPress {
+        start_capture();
+        return;
+    }
     let targets = {
         let mut manager = hotkey_manager().lock();
         let mut targets = Vec::with_capacity(manager.targets.len());
@@ -536,7 +578,11 @@ fn dispatch_hotkey(hotkey: Hotkey, event: HotkeyEvent) {
     }
 }
 
+/// Maps a hotkey event to the action configured for that key on one target.
 fn dispatch_to_target(target: &HotkeyTarget, hotkey: Hotkey, event: HotkeyEvent) {
+    if hotkey == Hotkey::F5 && event != HotkeyEvent::ShortRelease {
+        return;
+    }
     if let Some(action) = configured_action(&target.hotkeys, hotkey) {
         match (action, event) {
             (3, HotkeyEvent::LongPress) => {
@@ -545,8 +591,18 @@ fn dispatch_to_target(target: &HotkeyTarget, hotkey: Hotkey, event: HotkeyEvent)
                     .record(OverlayFeedbackEvent::HotkeyPressed(hotkey));
                 let renderer = target.overlay_renderer.toggle();
                 diagnostics::info(format!("[CONTROL] Overlay renderer {renderer:?}"));
+                target.save(Change::Renderer(match renderer {
+                    crate::layer::settings::OverlayRenderer::Ascii => "ascii",
+                    crate::layer::settings::OverlayRenderer::Modern => "modern",
+                    crate::layer::settings::OverlayRenderer::Helix => "helix",
+                }));
             }
-            (3, HotkeyEvent::ShortRelease) | (0..=2, HotkeyEvent::Press) => {
+            (3, HotkeyEvent::ShortRelease) | (0..=2, HotkeyEvent::Press)
+                if hotkey != Hotkey::F5 =>
+            {
+                dispatch_action(target, action, hotkey);
+            }
+            (0..=3, HotkeyEvent::ShortRelease) if hotkey == Hotkey::F5 => {
                 dispatch_action(target, action, hotkey);
             }
             _ => {}
@@ -554,10 +610,12 @@ fn dispatch_to_target(target: &HotkeyTarget, hotkey: Hotkey, event: HotkeyEvent)
     }
 }
 
+/// Returns the action index (0-3) assigned to `hotkey`, if any.
 fn configured_action(hotkeys: &[Hotkey; 4], hotkey: Hotkey) -> Option<usize> {
     hotkeys.iter().position(|configured| *configured == hotkey)
 }
 
+/// Runs an action: cycle regulation mode, raise or lower the target, or cycle the overlay mode.
 fn dispatch_action(target: &HotkeyTarget, action: usize, hotkey: Hotkey) {
     target
         .overlay_feedback
@@ -573,18 +631,39 @@ fn dispatch_action(target: &HotkeyTarget, action: usize, hotkey: Hotkey) {
                     .overlay_feedback
                     .record(OverlayFeedbackEvent::CapChanged);
                 diagnostics::info("[CONTROL] FPS regulation mode MANUAL");
+                target.save(Change::Mode {
+                    mode: "manual",
+                    algorithm: None,
+                    manual_fps: Some(f32::from_bits(target.manual_fps.load(Ordering::Relaxed))),
+                });
             }
             Ok(RegulationMode::Automatic(index)) => {
                 diagnostics::info(format!(
                     "[CONTROL] FPS regulation mode AUTO ({})",
                     index + 1
                 ));
+                if let Some(name) = target.auto_names.get(index) {
+                    target.save(Change::Mode {
+                        mode: "auto",
+                        algorithm: Some(name),
+                        manual_fps: None,
+                    });
+                } else {
+                    diagnostics::error(
+                        "[CONTROL] active AUTO algorithm has no name; mode not saved",
+                    );
+                }
             }
             Ok(RegulationMode::Off) => {
                 target
                     .overlay_feedback
                     .record(OverlayFeedbackEvent::CapChanged);
                 diagnostics::info("[CONTROL] FPS regulation mode OFF");
+                target.save(Change::Mode {
+                    mode: "off",
+                    algorithm: None,
+                    manual_fps: None,
+                });
             }
             Err(error) => diagnostics::error(format!(
                 "[CONTROL] unable to cycle FPS regulation mode: {error}"
@@ -595,11 +674,13 @@ fn dispatch_action(target: &HotkeyTarget, action: usize, hotkey: Hotkey) {
         3 => {
             let mode = target.overlay_mode.cycle();
             diagnostics::info(format!("[CONTROL] Overlay {mode:?}"));
+            target.save(Change::OverlayMode(mode as u8));
         }
         _ => unreachable!("a configured hotkey has one of four actions"),
     }
 }
 
+/// Steps the active AUTO target or hysteresis, or the manual FPS limit, up or down.
 fn adjust_target(target: &HotkeyTarget, direction: f32) {
     let active = target.active_auto_algorithm.load(Ordering::Relaxed);
     if active > 0 {
@@ -639,10 +720,23 @@ fn adjust_target(target: &HotkeyTarget, direction: f32) {
                 metric.hysteresis_unit(),
                 metric.hysteresis_unit()
             ));
+            if let Some(name) = target.auto_names.get(index) {
+                target.save(Change::AutoValue {
+                    algorithm: name,
+                    order: &target.auto_names,
+                    field,
+                    value: new,
+                });
+            } else {
+                diagnostics::error(
+                    "[CONTROL] active AUTO algorithm has no name; setting not saved",
+                );
+            }
         } else if metric != AutoMetric::Fps {
             diagnostics::warn("[CONTROL] AUTO target unchanged: step is zero or the new target is not a positive finite value");
         }
     } else if let Some((old, new)) = target.controller.adjust(direction * target.manual_step_fps) {
+        target.manual_fps.store(new.to_bits(), Ordering::Relaxed);
         target
             .overlay_feedback
             .record(OverlayFeedbackEvent::CapChanged);
@@ -650,9 +744,20 @@ fn adjust_target(target: &HotkeyTarget, direction: f32) {
         diagnostics::info(format!(
             "[CONTROL] FPS Limit {verb}: {old:.1} -> {new:.1} fps"
         ));
+        target.save(Change::ManualFps(new));
     }
 }
 
+impl HotkeyTarget {
+    /// Persists a change to the user configuration when a config path is known.
+    fn save(&self, change: Change<'_>) {
+        if let Some(path) = &self.persistence_path {
+            persistence::save(path, change);
+        }
+    }
+}
+
+/// FPS regulation state reached by cycling: fixed limit, numbered AUTO algorithm, or disabled.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RegulationMode {
     Manual,
@@ -724,7 +829,10 @@ mod tests {
             auto_hysteresis: Arc::new(vec![AtomicU32::new(5.0_f32.to_bits())]),
             auto_targets: Arc::new(vec![AtomicU64::new(0)]),
             auto_metrics: vec![AutoMetric::Fps],
+            auto_names: vec!["gpu_threshold".to_owned()],
+            persistence_path: None,
             manual_step_fps: 5.0,
+            manual_fps: AtomicU32::new(60.0_f32.to_bits()),
             overlay_feedback: Arc::new(OverlayFeedbackState::new()),
             hotkeys: [Hotkey::F5, Hotkey::F7, Hotkey::F6, Hotkey::F8],
         };
@@ -733,11 +841,96 @@ mod tests {
         dispatch_to_target(&target, Hotkey::F7, HotkeyEvent::Press);
         assert_eq!(target.controller.target_fps(), Some(60.0));
         dispatch_to_target(&target, Hotkey::F5, HotkeyEvent::Press);
+        assert_eq!(target.active_auto_algorithm.load(Ordering::Relaxed), 0);
+        dispatch_to_target(&target, Hotkey::F5, HotkeyEvent::LongPress);
+        assert_eq!(target.active_auto_algorithm.load(Ordering::Relaxed), 0);
+        dispatch_to_target(&target, Hotkey::F5, HotkeyEvent::ShortRelease);
         assert_eq!(target.active_auto_algorithm.load(Ordering::Relaxed), 1);
         dispatch_to_target(&target, Hotkey::F8, HotkeyEvent::ShortRelease);
         assert_eq!(target.overlay_mode.mode(), OverlayMode::Fps);
         dispatch_to_target(&target, Hotkey::F8, HotkeyEvent::LongPress);
-        assert_eq!(target.overlay_renderer.current(), OverlayRenderer::Ascii);
+        assert_eq!(target.overlay_renderer.current(), OverlayRenderer::Helix);
+    }
+
+    #[test]
+    fn hotkey_changes_are_restored_from_user_configuration() {
+        use crate::layer::config::{Config, StartupMode};
+        use crate::layer::settings::{OverlayRenderer, Settings};
+
+        let directory = std::env::temp_dir().join(format!(
+            "framecap-hotkey-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("framecap.toml");
+        persistence::ensure_default_at(&path).unwrap();
+        let target = HotkeyTarget {
+            controller: Arc::new(FrameCapController::new(Some(60.0))),
+            overlay_mode: Arc::new(OverlayModeState::new(2)),
+            overlay_renderer: Arc::new(OverlayRendererState::new(OverlayRenderer::Ascii)),
+            active_auto_algorithm: Arc::new(AtomicI32::new(0)),
+            auto_hysteresis: Arc::new(vec![
+                AtomicU32::new(5.0_f32.to_bits()),
+                AtomicU32::new(5.0_f32.to_bits()),
+                AtomicU32::new(50.0_f32.to_bits()),
+            ]),
+            auto_targets: Arc::new(vec![
+                AtomicU64::new(0),
+                AtomicU64::new(u64::from(100.0_f32.to_bits())),
+                AtomicU64::new(u64::from(2000.0_f32.to_bits())),
+            ]),
+            auto_metrics: vec![AutoMetric::Fps, AutoMetric::GpuVrmTempC, AutoMetric::FanRpm],
+            auto_names: vec!["gpu_threshold".into(), "vrm_temp".into(), "fan_rpm".into()],
+            persistence_path: Some(path.clone()),
+            manual_step_fps: 5.0,
+            manual_fps: AtomicU32::new(60.0_f32.to_bits()),
+            overlay_feedback: Arc::new(OverlayFeedbackState::new()),
+            hotkeys: [Hotkey::F5, Hotkey::F7, Hotkey::F6, Hotkey::F8],
+        };
+        let press = |key| {
+            dispatch_to_target(
+                &target,
+                key,
+                if key == Hotkey::F5 {
+                    HotkeyEvent::ShortRelease
+                } else {
+                    HotkeyEvent::Press
+                },
+            )
+        };
+        press(Hotkey::F7);
+        dispatch_to_target(&target, Hotkey::F8, HotkeyEvent::ShortRelease);
+        dispatch_to_target(&target, Hotkey::F8, HotkeyEvent::LongPress);
+        press(Hotkey::F5);
+        press(Hotkey::F7);
+        press(Hotkey::F5);
+        press(Hotkey::F7);
+        press(Hotkey::F5);
+        press(Hotkey::F6);
+        let load = || Config::from_settings(Settings::load_from_path(path.clone()));
+        let config = load();
+        assert_eq!(config.target_fps, Some(65.0));
+        assert_eq!(config.startup_mode, StartupMode::Automatic(2));
+        assert_eq!(config.auto_algorithms[0].hysteresis, 6.0);
+        assert_eq!(
+            config.auto_algorithms[1].target,
+            crate::layer::config::AutoTarget::Value(105.0)
+        );
+        assert_eq!(
+            config.auto_algorithms[2].target,
+            crate::layer::config::AutoTarget::Value(1950.0)
+        );
+        assert_eq!(config.startup, 1);
+        assert_eq!(config.overlay_renderer, OverlayRenderer::Modern);
+        assert!(target.controller.set_target_fps(Some(80.0)));
+        press(Hotkey::F5);
+        assert_eq!(load().startup_mode, StartupMode::Off);
+        assert_eq!(load().target_fps, Some(65.0));
+        press(Hotkey::F5);
+        assert_eq!(load().startup_mode, StartupMode::Manual);
+        assert_eq!(load().target_fps, Some(65.0));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -783,7 +976,14 @@ mod tests {
                 AtomicU64::new(u64::from(100.0_f32.to_bits())),
             ]),
             auto_metrics: vec![AutoMetric::FanRpm, AutoMetric::Fps, AutoMetric::GpuVrmTempC],
+            auto_names: vec![
+                "fan_rpm".to_owned(),
+                "gpu_threshold".to_owned(),
+                "vrm_temp".to_owned(),
+            ],
+            persistence_path: None,
             manual_step_fps: 5.0,
+            manual_fps: AtomicU32::new(60.0_f32.to_bits()),
             overlay_feedback: Arc::new(OverlayFeedbackState::new()),
             hotkeys: [Hotkey::F5, Hotkey::F7, Hotkey::F6, Hotkey::F8],
         };
@@ -872,7 +1072,10 @@ mod tests {
             auto_hysteresis: Arc::new(vec![AtomicU32::new(7.5_f32.to_bits())]),
             auto_targets: regulator.targets(),
             auto_metrics: vec![AutoMetric::GpuVrmTempC],
+            auto_names: vec!["vrm_temp".to_owned()],
+            persistence_path: None,
             manual_step_fps: 5.0,
+            manual_fps: AtomicU32::new(60.0_f32.to_bits()),
             overlay_feedback: Arc::new(OverlayFeedbackState::new()),
             hotkeys: [Hotkey::F5, Hotkey::F7, Hotkey::F6, Hotkey::F8],
         };
@@ -911,7 +1114,10 @@ mod tests {
             auto_hysteresis: Arc::new(Vec::new()),
             auto_targets: Arc::new(Vec::new()),
             auto_metrics: Vec::new(),
+            auto_names: Vec::new(),
+            persistence_path: None,
             manual_step_fps: 5.0,
+            manual_fps: AtomicU32::new(60.0_f32.to_bits()),
             overlay_feedback: Arc::new(OverlayFeedbackState::new()),
             hotkeys: [Hotkey::F6, Hotkey::F8, Hotkey::F5, Hotkey::F7],
         };
@@ -930,7 +1136,7 @@ mod tests {
         assert!(key.long_press_due(now + LONG_PRESS));
         dispatch(HotkeyEvent::LongPress);
         assert_eq!(target.overlay_mode.mode(), OverlayMode::Fps);
-        assert_eq!(target.overlay_renderer.current(), OverlayRenderer::Ascii);
+        assert_eq!(target.overlay_renderer.current(), OverlayRenderer::Helix);
         assert!(!key.long_press_due(now + Duration::from_secs(3)));
         assert_eq!(key.release(5000), None);
         assert_eq!(
@@ -947,14 +1153,20 @@ mod tests {
         assert!(key.long_press_due(now + LONG_PRESS));
         dispatch(HotkeyEvent::LongPress);
         assert_eq!(target.overlay_mode.mode(), OverlayMode::Off);
-        assert_eq!(target.overlay_renderer.current(), OverlayRenderer::Modern);
+        assert_eq!(target.overlay_renderer.current(), OverlayRenderer::Ascii);
         assert_eq!(key.release(8000), None);
 
         dispatch_to_target(&target, Hotkey::F8, HotkeyEvent::Press);
         dispatch_to_target(&target, Hotkey::F8, HotkeyEvent::LongPress);
         dispatch_to_target(&target, Hotkey::F8, HotkeyEvent::ShortRelease);
         assert_eq!(target.controller.target_fps(), Some(65.0));
-        assert_eq!(target.overlay_renderer.current(), OverlayRenderer::Modern);
+        assert_eq!(target.overlay_renderer.current(), OverlayRenderer::Ascii);
+
+        dispatch_to_target(&target, Hotkey::F5, HotkeyEvent::Press);
+        dispatch_to_target(&target, Hotkey::F5, HotkeyEvent::LongPress);
+        assert_eq!(target.controller.target_fps(), Some(65.0));
+        dispatch_to_target(&target, Hotkey::F5, HotkeyEvent::ShortRelease);
+        assert_eq!(target.controller.target_fps(), Some(60.0));
     }
 
     #[test]
@@ -968,6 +1180,18 @@ mod tests {
             PressedKey::new(u32::MAX - 499, now).release(500),
             Some(HotkeyEvent::LongPress)
         );
+    }
+
+    #[test]
+    fn long_physical_f5_starts_capture_once_and_suppresses_short_action() {
+        let now = Instant::now();
+        let mut key = PressedKey::new(0, now);
+        let mut starts = 0;
+        assert!(key.long_press_due(now + LONG_PRESS));
+        dispatch_hotkey_with(Hotkey::F5, HotkeyEvent::LongPress, || starts += 1);
+        assert!(!key.long_press_due(now + LONG_PRESS * 2));
+        assert_eq!(key.release(2000), None);
+        assert_eq!(starts, 1);
     }
 
     #[test]

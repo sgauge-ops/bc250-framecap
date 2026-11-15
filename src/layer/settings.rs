@@ -1,10 +1,11 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-#[derive(Clone, Debug)]
+/// `[framecap]` section: sample window size and GPU/memory polling intervals.
+#[derive(Clone, Debug, Serialize)]
 pub struct FramecapSettings {
     pub window_size: usize,
     pub gpu_poll_rate_ms: u64,
@@ -22,7 +23,8 @@ impl Default for FramecapSettings {
     }
 }
 
-#[derive(Clone, Debug)]
+/// `[key-bindings]` section: whether global shortcuts are enabled and which function keys they use.
+#[derive(Clone, Debug, Serialize)]
 pub struct KeyBindingsSettings {
     pub input_enabled: bool,
     pub hotkey_auto: String,
@@ -44,7 +46,8 @@ impl Default for KeyBindingsSettings {
     }
 }
 
-#[derive(Clone, Debug)]
+/// `[overlay]` section: renderer, refresh rate, smoothing, scaling threshold, colours and startup level.
+#[derive(Clone, Debug, Serialize)]
 pub struct OverlaySettings {
     pub renderer: OverlayRenderer,
     pub refresh_rate: u64,
@@ -55,12 +58,14 @@ pub struct OverlaySettings {
     pub startup: u8,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+/// Overlay rendering style selectable in the configuration file.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OverlayRenderer {
     #[default]
     Ascii,
     Modern,
+    Helix,
 }
 
 impl Default for OverlaySettings {
@@ -78,13 +83,15 @@ impl Default for OverlaySettings {
     }
 }
 
+/// `[auto-mode]` section: the ordered list of automatic algorithms and their settings.
 #[derive(Clone, Debug)]
 pub struct AutoModeSettings {
     pub algorithm_order: Vec<String>,
     pub algorithms: Vec<AutoAlgorithmSettings>,
 }
 
-#[derive(Clone, Debug)]
+/// Extra settings of the `gpu_threshold` algorithm: GPU load limits and frame jitter limit.
+#[derive(Clone, Debug, Serialize)]
 pub struct GpuThresholdSettings {
     pub gpu_increase_limit: f32,
     pub gpu_decrease_limit: f32,
@@ -92,6 +99,7 @@ pub struct GpuThresholdSettings {
 }
 
 impl Default for GpuThresholdSettings {
+    /// Returns the built-in GPU load and frame jitter limits.
     fn default() -> Self {
         Self {
             gpu_increase_limit: 98.0,
@@ -101,14 +109,18 @@ impl Default for GpuThresholdSettings {
     }
 }
 
-#[derive(Clone, Debug)]
+/// Algorithm target as written in the file: a named metric such as `low_10_fps` or a numeric value.
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
 pub enum AutoTargetSettings {
     Metric(String),
     Value(f32),
 }
 
-#[derive(Clone, Debug)]
+/// One `[auto-mode.algorithms.<name>]` entry: metric, target, hysteresis, window, FPS steps and bounds.
+#[derive(Clone, Debug, Serialize)]
 pub struct AutoAlgorithmSettings {
+    #[serde(skip)]
     pub name: String,
     pub metric: String,
     pub target: AutoTargetSettings,
@@ -118,6 +130,7 @@ pub struct AutoAlgorithmSettings {
     pub auto_decrease_step_fps: f32,
     pub min_fps: f32,
     pub max_fps: f32,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub gpu_threshold: Option<GpuThresholdSettings>,
 }
 
@@ -172,11 +185,19 @@ impl Default for AutoModeSettings {
     }
 }
 
-#[derive(Clone, Debug)]
+/// `[manual-mode]` section: startup mode and FPS plus the step and bounds of manual adjustment.
+#[derive(Clone, Debug, Serialize)]
 pub struct ManualModeSettings {
     pub startup_fps: f32,
+    #[serde(skip)]
+    pub startup_mode: Option<String>,
+    #[serde(skip)]
+    pub startup_algorithm: Option<String>,
+    #[serde(rename = "step_fps")]
     pub manual_step_fps: f32,
+    #[serde(rename = "min_fps")]
     pub manual_min_fps: f32,
+    #[serde(rename = "max_fps")]
     pub manual_max_fps: f32,
 }
 
@@ -185,6 +206,8 @@ impl Default for ManualModeSettings {
     fn default() -> Self {
         Self {
             startup_fps: 60.0,
+            startup_mode: None,
+            startup_algorithm: None,
             manual_step_fps: 5.0,
             manual_min_fps: 1.0,
             manual_max_fps: 240.0,
@@ -192,20 +215,23 @@ impl Default for ManualModeSettings {
     }
 }
 
+/// `[diagnostics]` section: optional log file path and whether to append to it.
 #[derive(Clone, Debug, Default)]
 pub struct DiagnosticsSettings {
     pub log_path: Option<PathBuf>,
     pub append_log: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+/// Identifies a hardware sensor by device name and label.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SensorSelector {
     pub device: String,
     pub label: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+/// `[sensors]` section: per-metric sysfs paths or device/label selectors for temperature, power and fan readings.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MetricsSettings {
     pub cpu_temp_path: Option<PathBuf>,
@@ -226,15 +252,33 @@ pub struct MetricsSettings {
     pub fan_rpm: Option<SensorSelector>,
 }
 
-#[derive(Clone, Debug)]
+/// Complete user configuration, one field per TOML section.
+#[derive(Clone, Debug, Serialize)]
 pub struct Settings {
     pub framecap: FramecapSettings,
+    #[serde(rename = "key-bindings")]
     pub key_bindings: KeyBindingsSettings,
     pub overlay: OverlaySettings,
+    #[serde(rename = "auto-mode")]
     pub auto_mode: AutoModeSettings,
+    #[serde(rename = "manual-mode")]
     pub manual_mode: ManualModeSettings,
+    #[serde(skip)]
     pub diagnostics: DiagnosticsSettings,
+    #[serde(rename = "sensors")]
     pub metrics: MetricsSettings,
+}
+
+impl Serialize for AutoModeSettings {
+    /// Serializes algorithms as a table keyed by name, alongside `algorithm_order`.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let algorithms: BTreeMap<_, _> = self.algorithms.iter().map(|a| (&a.name, a)).collect();
+        let mut state = serializer.serialize_struct("AutoModeSettings", 2)?;
+        state.serialize_field("algorithm_order", &self.algorithm_order)?;
+        state.serialize_field("algorithms", &algorithms)?;
+        state.end()
+    }
 }
 
 impl Default for Settings {
@@ -252,6 +296,7 @@ impl Default for Settings {
     }
 }
 
+/// Deserialization mirror of `Settings` with every field optional so absent keys fall back to defaults.
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 struct RawSettings {
@@ -268,6 +313,7 @@ struct RawSettings {
     metrics: RawMetricsSettings,
 }
 
+/// Raw `[framecap]` section, also accepting legacy keys that now live in other sections.
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 struct RawFramecapSettings {
@@ -291,6 +337,7 @@ struct RawFramecapSettings {
     manual_max_fps: Option<f32>,
 }
 
+/// Raw `[key-bindings]` section.
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 struct RawKeyBindingsSettings {
@@ -301,6 +348,7 @@ struct RawKeyBindingsSettings {
     hotkey_toggle: Option<String>,
 }
 
+/// Raw `[overlay]` section.
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 struct RawOverlaySettings {
@@ -314,6 +362,7 @@ struct RawOverlaySettings {
     startup: Option<u8>,
 }
 
+/// Deserializes an optional RGB colour, rejecting arrays that do not have exactly three channels.
 fn deserialize_rgb<'de, D>(deserializer: D) -> Result<Option<[u8; 3]>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -328,6 +377,7 @@ where
         .transpose()
 }
 
+/// Raw `[auto-mode]` section: algorithm order and a map of raw algorithm tables.
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 struct RawAutoModeSettings {
@@ -335,6 +385,7 @@ struct RawAutoModeSettings {
     algorithms: Option<BTreeMap<String, RawAutoAlgorithmSettings>>,
 }
 
+/// Raw `[auto-mode.algorithms.<name>]` table, including the `gpu_threshold`-only limits.
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 struct RawAutoAlgorithmSettings {
@@ -351,6 +402,7 @@ struct RawAutoAlgorithmSettings {
     frame_jitter_limit: Option<f32>,
 }
 
+/// Raw algorithm target: a metric name or a number.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum RawAutoTarget {
@@ -358,10 +410,13 @@ enum RawAutoTarget {
     Value(f32),
 }
 
+/// Raw `[manual-mode]` section.
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 struct RawManualModeSettings {
     startup_fps: Option<f32>,
+    startup_mode: Option<String>,
+    startup_algorithm: Option<String>,
     #[serde(rename = "step_fps")]
     manual_step_fps: Option<f32>,
     #[serde(rename = "min_fps")]
@@ -370,6 +425,7 @@ struct RawManualModeSettings {
     manual_max_fps: Option<f32>,
 }
 
+/// Raw `[diagnostics]` section; `append_log` is a 0/1 integer.
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 struct RawDiagnosticsSettings {
@@ -377,13 +433,28 @@ struct RawDiagnosticsSettings {
     append_log: Option<u8>,
 }
 
+/// The raw `[sensors]` section is deserialized directly into `MetricsSettings`.
 type RawMetricsSettings = MetricsSettings;
 
 impl Settings {
     /// Loads the first available TOML configuration and returns normalized settings.
     pub fn load() -> (Self, Option<PathBuf>, bool) {
-        let candidates = config_candidates();
-        let Some(path) = candidates.iter().find(|path| path.is_file()).cloned() else {
+        if let Err(error) = crate::layer::persistence::ensure_default() {
+            eprintln!("Framecap: unable to initialize user configuration: {error}");
+        }
+        Self::load_candidates(config_candidates())
+    }
+
+    /// Reads the first existing candidate file, merging legacy keys and defaults; returns the settings, the path used and whether legacy keys were found.
+    fn load_candidates(candidates: Vec<PathBuf>) -> (Self, Option<PathBuf>, bool) {
+        let Some(path) = candidates
+            .iter()
+            .find(|path| match fs::symlink_metadata(path) {
+                Ok(_) => true,
+                Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+            })
+            .cloned()
+        else {
             return (Self::default(), candidates.into_iter().next(), false);
         };
 
@@ -503,6 +574,8 @@ impl Settings {
             },
             manual_mode: ManualModeSettings {
                 startup_fps,
+                startup_mode: manual_mode.startup_mode,
+                startup_algorithm: manual_mode.startup_algorithm,
                 manual_step_fps: manual_mode
                     .manual_step_fps
                     .or(framecap.manual_step_fps)
@@ -525,6 +598,12 @@ impl Settings {
 
         (settings, Some(path), legacy)
     }
+
+    /// Test helper that loads settings from a single path.
+    #[cfg(test)]
+    pub(super) fn load_from_path(path: PathBuf) -> Self {
+        Self::load_candidates(vec![path]).0
+    }
 }
 
 /// Reports whether the legacy `[framecap]` section contains moved settings.
@@ -546,6 +625,7 @@ fn has_legacy_settings(framecap: &RawFramecapSettings) -> bool {
         || framecap.manual_max_fps.is_some()
 }
 
+/// Picks `[manual-mode].startup_fps` over the legacy `[framecap].target_fps`, warning when both are set.
 fn resolve_startup_fps(startup: Option<f32>, legacy: Option<f32>, default: f32) -> f32 {
     if startup.is_some() && legacy.is_some() {
         eprintln!(
@@ -555,6 +635,7 @@ fn resolve_startup_fps(startup: Option<f32>, legacy: Option<f32>, default: f32) 
     startup.or(legacy).unwrap_or(default)
 }
 
+/// Builds the algorithm list from the raw table, or from `order` and the defaults when no table is given.
 fn parse_auto_algorithms(
     raw_algorithms: Option<BTreeMap<String, RawAutoAlgorithmSettings>>,
     order: Vec<String>,
@@ -582,6 +663,7 @@ fn parse_auto_algorithms(
     parse_ordered_auto_algorithms(raw_algorithms, order, defaults)
 }
 
+/// Merges raw algorithm tables with defaults in `algorithm_order`, ignoring duplicate, missing, unknown or unlisted entries and falling back to defaults if none remain.
 fn parse_ordered_auto_algorithms(
     mut raw_algorithms: BTreeMap<String, RawAutoAlgorithmSettings>,
     order: Vec<String>,
@@ -669,14 +751,28 @@ fn parse_ordered_auto_algorithms(
 
 /// Lists configuration paths in the precedence order used by the loader.
 fn config_candidates() -> Vec<PathBuf> {
-    let mut candidates = vec![PathBuf::from("framecap.toml")];
-    if let Some(xdg_config) = env::var_os("XDG_CONFIG_HOME") {
-        candidates.push(PathBuf::from(xdg_config).join("framecap.toml"));
-    }
-    if let Some(home) = env::var_os("HOME") {
+    config_candidates_from(env::var_os("HOME"), env::var_os("XDG_CONFIG_HOME"))
+}
+
+/// Builds the candidate list from explicit `HOME` and `XDG_CONFIG_HOME` values: `~/.config`, the working directory, then XDG.
+fn config_candidates_from(
+    home: Option<std::ffi::OsString>,
+    xdg_config: Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(home) = home.filter(|home| !home.is_empty()) {
         candidates.push(PathBuf::from(home).join(".config/framecap.toml"));
     }
+    candidates.push(PathBuf::from("framecap.toml"));
+    if let Some(xdg_config) = xdg_config {
+        candidates.push(PathBuf::from(xdg_config).join("framecap.toml"));
+    }
     candidates
+}
+
+/// Checks that `content` parses as a valid configuration, rejecting unknown keys and bad types.
+pub(super) fn validate_configuration(content: &str) -> Result<(), toml::de::Error> {
+    toml::from_str::<RawSettings>(content).map(|_| ())
 }
 
 /// Resolves the log-retention option to an append policy.
@@ -696,6 +792,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn global_configuration_precedes_local_and_xdg() {
+        assert_eq!(
+            config_candidates_from(Some("/home/user".into()), Some("/xdg".into())),
+            [
+                PathBuf::from("/home/user/.config/framecap.toml"),
+                PathBuf::from("framecap.toml"),
+                PathBuf::from("/xdg/framecap.toml"),
+            ]
+        );
+    }
+
+    #[test]
     fn memory_poll_rate_defaults_and_parses() {
         assert_eq!(Settings::default().framecap.memory_poll_rate_ms, 5000);
         for value in [0, 1999, 2000, 5000] {
@@ -703,6 +811,7 @@ mod tests {
                 toml::from_str(&format!("[framecap]\nmemory_poll_rate_ms = {value}")).unwrap();
             assert_eq!(raw.framecap.memory_poll_rate_ms, Some(value));
         }
+
         assert!(toml::from_str::<RawSettings>("[framecap]\nmemory_poll_rate_ms = -1").is_err());
         assert!(
             toml::from_str::<RawSettings>("[framecap]\nmemory_poll_rate_ms = \"5000\"").is_err()
@@ -762,6 +871,7 @@ mod tests {
         for (value, expected) in [
             ("ascii", OverlayRenderer::Ascii),
             ("modern", OverlayRenderer::Modern),
+            ("helix", OverlayRenderer::Helix),
         ] {
             let settings: RawSettings =
                 toml::from_str(&format!("[overlay]\nrenderer = \"{value}\"")).unwrap();
@@ -983,7 +1093,7 @@ mod tests {
     /// Checks that the shipped example parses with its active GPU and jitter thresholds.
     fn shipped_configuration_parses_gpu_and_jitter_thresholds() {
         let settings: RawSettings = toml::from_str(include_str!("../../framecap.toml")).unwrap();
-        assert_eq!(settings.overlay.renderer, Some(OverlayRenderer::Modern));
+        assert_eq!(settings.overlay.renderer, Some(OverlayRenderer::Helix));
         assert_eq!(settings.manual_mode.startup_fps, Some(90.0));
         assert_eq!(settings.framecap.target_fps, None);
         let gpu_threshold = settings

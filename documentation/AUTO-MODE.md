@@ -21,7 +21,9 @@ configured in `[auto-mode.algorithms.gpu_threshold]`; they only affect the
 `gpu_threshold` algorithm. The shipped example may differ from the built-in
 defaults.
 
-A valid positive `[manual-mode].startup_fps` starts in manual mode; zero starts OFF. F5
+Without an explicit startup mode, a positive `[manual-mode].startup_fps` starts
+in manual mode and zero starts OFF. The selected mode and AUTO algorithm are
+saved in `[manual-mode]` and restored at startup. F5
 cycles manual through the configured algorithms and OFF, then restores the
 last cap in manual mode. By default the order is JIT, VRM, FAN. The overlay
 shows the name `AUTO (JIT)`, `AUTO (VRM)`, or `AUTO (FAN)` independently of
@@ -30,8 +32,8 @@ they decrease/increase the active numerical target by that algorithm's
 configured hysteresis (5 °C and 50 RPM by default), without changing the
 hysteresis itself. A zero hysteresis gives a zero step; changes that would
 make the target non-positive or non-finite are rejected. Target changes are
-temporary, independent per algorithm, and reset when the application restarts;
-they do not rewrite the configuration. In manual mode F6/F7 change the cap by
+independent per algorithm and saved to the user configuration. Automatic
+changes to the FPS cap are not saved. In manual mode F6/F7 change the cap by
 `[manual-mode].step_fps`. They do not change a parameter in OFF. Global
 shortcuts require X11/XWayland.
 

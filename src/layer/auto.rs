@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Runtime state of one configured auto algorithm: its config and adjustment bookkeeping.
 struct AlgorithmState {
     config: AutoAlgorithmConfig,
     pending: Option<(bool, Instant)>,
@@ -14,6 +15,7 @@ struct AlgorithmState {
     last_target_version: Option<u64>,
 }
 
+/// Evaluates auto algorithms against metrics and adjusts the frame cap target.
 pub struct AutoRegulator {
     algorithms: Vec<AlgorithmState>,
     gpu_increase_limit: f32,
@@ -23,6 +25,7 @@ pub struct AutoRegulator {
     targets: Arc<Vec<AtomicU64>>,
 }
 
+/// Rate-limits auto evaluations to one per interval for the active algorithm.
 pub struct AutoEvaluationSchedule {
     interval: Duration,
     last_evaluation: Option<Instant>,
@@ -61,6 +64,7 @@ impl AutoEvaluationSchedule {
         true
     }
 
+    /// Returns whether the last evaluation is older than twice the interval (at least 2 s).
     pub fn has_gap(&self, now: Instant) -> bool {
         let tolerance = self.interval.saturating_mul(2).max(Duration::from_secs(2));
         self.last_evaluation
@@ -108,10 +112,12 @@ impl AutoRegulator {
         }
     }
 
+    /// Returns the shared per-algorithm target values, stored as `f32` bits.
     pub fn targets(&self) -> Arc<Vec<AtomicU64>> {
         Arc::clone(&self.targets)
     }
 
+    /// Selects the active algorithm, discarding pending decisions when the selection changes.
     pub fn set_active(&mut self, algorithm_index: Option<usize>) {
         if self.active_algorithm != algorithm_index {
             for state in &mut self.algorithms {
@@ -121,16 +127,19 @@ impl AutoRegulator {
         }
     }
 
+    /// Clears the pending adjustment of one algorithm.
     pub fn reset_pending(&mut self, algorithm_index: usize) {
         if let Some(state) = self.algorithms.get_mut(algorithm_index) {
             state.pending = None;
         }
     }
 
+    /// Iterates over the metrics window of every configured algorithm.
     pub fn windows(&self) -> impl Iterator<Item = Duration> + '_ {
         self.algorithms.iter().map(|state| state.config.window)
     }
 
+    /// Returns the metric an algorithm observes, if the index is valid.
     pub fn metric(&self, algorithm_index: usize) -> Option<AutoMetric> {
         self.algorithms
             .get(algorithm_index)
@@ -147,6 +156,7 @@ impl AutoRegulator {
         }
     }
 
+    /// Returns an algorithm's metric and its current target, reading live values from the shared store.
     pub fn overlay_target(&self, algorithm_index: usize) -> Option<(AutoMetric, AutoTarget)> {
         let config = &self.algorithms.get(algorithm_index)?.config;
         let target = match config.target {

@@ -24,10 +24,10 @@ ppt_power = { device = "amdgpu", label = "PPT" }
 fan_rpm = { device = "nct6686", label = "Pump Fan" }
 
 [overlay]
-renderer = "modern"                 # "modern" graphical layout or "ascii" text layout; built-in default: "ascii".
+renderer = "helix"                 # "modern" graphical layout, "helix" monospace panel or "ascii" text layout; built-in default: "ascii".
 startup = 2                         # Overlay at startup: 0 off, 1 FPS only, 2 full. Built-in default: 2.
 background_opacity = 0.5            # Overlay background opacity. Built-in default: 0.25; 0.0 is fully transparent and 1.0 fully opaque; valid range: 0.0-1.0; invalid values use the default.
-fps_color = [255, 255, 0]           # FPS value color as RGB integers (0-255). Built-in default: yellow [255, 255, 0].
+fps_color = [255, 205, 0]           # FPS value color as RGB integers (0-255). Built-in default: yellow [255, 255, 0].
 refresh_rate = 25                   # Redraw the overlay every frame; refresh its displayed metrics every N presents.
 gpu_smoothing_window_ms = 1000      # Overlay rolling window for FPS, 10% low, jitter, GPU load, and sensors; AUTO uses each algorithm's own window. Built-in default: 1000 ms; must be positive.
 scale_2x_min_width_px = 3840        # Minimum swapchain width for doubling overlay text. Built-in default: 3840 px; must be positive; invalid values use the default.
@@ -35,7 +35,9 @@ scale_2x_min_width_px = 3840        # Minimum swapchain width for doubling overl
 # They all show COLLECT until at least one valid interval is available and gpu_poll_rate_ms has elapsed from startup or the CAP change.
 
 [manual-mode]
-startup_fps = 90    # Initial FPS cap; 0 starts OFF. Built-in default: 60 FPS; valid range: 0 or 1-240; invalid values disable the cap.
+startup_fps = 90    # Remembered FPS cap; without startup_mode, 0 starts OFF. Built-in default: 60 FPS; valid range: 0 or 1-240.
+# startup_mode = "manual"         # "off", "manual" or "auto"; saved by F5.
+# startup_algorithm = "gpu_threshold" # Required when startup_mode is "auto"; saved by F5.
 step_fps = 5.0      # Manual F6/F7 cap adjustment step. Built-in default: 5 FPS; must be finite and positive; invalid values use the default.
 min_fps = 5.0       # Manual target lower bound. Built-in default: 1 FPS; valid range: 1-240 and no greater than max_fps; invalid bounds use 1-240.
 max_fps = 240.0     # Manual target upper bound. Built-in default: 240 FPS; valid range: 1-240 and no less than min_fps; invalid bounds use 1-240.

@@ -2,6 +2,7 @@ use crate::layer::config::{DEFAULT_TARGET_FPS, MAX_TARGET_FPS, MIN_TARGET_FPS};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+/// Thread-safe frame-rate cap target with manual bounds and a generation counter for change detection.
 pub struct FrameCapController {
     target_fps_bits: AtomicU32,
     target_enabled: AtomicBool,
@@ -130,45 +131,35 @@ impl FrameCapController {
     }
 }
 
+/// Per-queue pacing state: the last downstream presentation and the active target.
 #[derive(Default)]
 pub struct FrameScheduler {
     target_fps: Option<f32>,
-    next_deadline: Option<Instant>,
+    last_present: Option<Instant>,
 }
 
 impl FrameScheduler {
-    /// Returns the next pacing deadline for a target, skipping missed periods.
+    /// Returns the configured target and the deadline implied by the last presentation.
+    pub(crate) fn scheduled_state(&self) -> (Option<f32>, Option<Instant>) {
+        (
+            self.target_fps,
+            self.last_present
+                .zip(self.target_fps)
+                .and_then(|(present, fps)| present.checked_add(frame_period(fps))),
+        )
+    }
+
+    /// Returns a deadline only when the previous presentation is too recent.
     pub fn next_deadline(&mut self, now: Instant, target_fps: Option<f32>) -> Option<Instant> {
-        let Some(target_fps) = target_fps else {
-            self.target_fps = None;
-            self.next_deadline = None;
-            return None;
-        };
-        if !target_fps.is_finite() || !(MIN_TARGET_FPS..=MAX_TARGET_FPS).contains(&target_fps) {
-            self.target_fps = None;
-            self.next_deadline = None;
-            return None;
-        }
+        self.target_fps = target_fps
+            .filter(|fps| fps.is_finite() && (MIN_TARGET_FPS..=MAX_TARGET_FPS).contains(fps));
+        let deadline = self.scheduled_state().1?;
+        (deadline > now).then_some(deadline)
+    }
 
-        if self.target_fps != Some(target_fps) || self.next_deadline.is_none() {
-            self.target_fps = Some(target_fps);
-            self.next_deadline = now.checked_add(frame_period(target_fps));
-            return None;
-        }
-
-        let period = frame_period(target_fps);
-        let deadline = self.next_deadline?;
-        if deadline <= now {
-            if now.duration_since(deadline) >= period {
-                self.next_deadline = now.checked_add(period);
-            } else {
-                self.next_deadline = deadline.checked_add(period);
-            }
-            return None;
-        }
-
-        self.next_deadline = deadline.checked_add(period);
-        Some(deadline)
+    /// Anchors the next period to the actual downstream presentation call.
+    pub(crate) fn record_present(&mut self, now: Instant) {
+        self.last_present = Some(now);
     }
 }
 
@@ -315,59 +306,99 @@ mod tests {
     }
 
     #[test]
-    /// Checks the initial wait and absolute cadence of the scheduler.
-    fn scheduler_waits_for_the_first_period_then_keeps_absolute_cadence() {
+    fn scheduler_anchors_each_deadline_to_the_actual_presentation() {
         let start = Instant::now();
         let period = frame_period(60.0);
         let mut scheduler = FrameScheduler::default();
 
         assert_eq!(scheduler.next_deadline(start, Some(60.0)), None);
+        scheduler.record_present(start);
         assert_eq!(
             scheduler.next_deadline(start + Duration::from_millis(5), Some(60.0)),
             Some(start + period)
         );
+        let actual = start + period + Duration::from_millis(5);
+        scheduler.record_present(actual);
         assert_eq!(
-            scheduler.next_deadline(start + period, Some(60.0)),
-            Some(start + period * 2)
+            scheduler.next_deadline(actual + Duration::from_millis(1), Some(60.0)),
+            Some(actual + period)
         );
     }
 
     #[test]
-    /// Checks that missed frame deadlines are skipped without catch-up bursts.
-    fn scheduler_skips_missed_deadlines_without_catching_up() {
+    fn scheduler_does_not_catch_up_after_a_frame_at_25ms() {
         let start = Instant::now();
         let period = frame_period(60.0);
         let mut scheduler = FrameScheduler::default();
-
-        scheduler.next_deadline(start, Some(60.0));
+        scheduler.record_present(start);
+        let late = start + Duration::from_millis(25);
+        assert_eq!(scheduler.next_deadline(late, Some(60.0)), None);
+        scheduler.record_present(late);
         assert_eq!(
-            scheduler.next_deadline(start + period * 3, Some(60.0)),
-            None
-        );
-        assert_eq!(
-            scheduler.next_deadline(start + period * 3, Some(60.0)),
-            Some(start + period * 4)
+            scheduler.next_deadline(late + Duration::from_millis(1), Some(60.0)),
+            Some(late + period)
         );
     }
 
     #[test]
-    /// Checks scheduler reset when the target changes or limiting is disabled.
-    fn scheduler_resets_when_target_changes_or_is_disabled() {
+    fn scheduler_rebases_after_missed_deadlines_without_catching_up() {
+        let start = Instant::now();
+        let period = frame_period(60.0);
+        for lateness in [
+            Duration::from_nanos(1),
+            period / 2,
+            period - Duration::from_nanos(1),
+            period,
+            period * 2,
+        ] {
+            let mut scheduler = FrameScheduler::default();
+            scheduler.record_present(start);
+            let late = start + period + lateness;
+            assert_eq!(scheduler.next_deadline(late, Some(60.0)), None);
+            scheduler.record_present(late);
+            assert_eq!(
+                scheduler.next_deadline(late + Duration::from_millis(1), Some(60.0)),
+                Some(late + period)
+            );
+        }
+    }
+
+    #[test]
+    fn scheduler_includes_work_after_wait_in_the_next_period() {
+        let start = Instant::now();
+        let period = frame_period(60.0);
+        let mut scheduler = FrameScheduler::default();
+        scheduler.record_present(start);
+        assert_eq!(
+            scheduler.next_deadline(start + Duration::from_millis(2), Some(60.0)),
+            Some(start + period)
+        );
+        let actual = start + period + Duration::from_millis(3);
+        scheduler.record_present(actual);
+        assert_eq!(
+            scheduler.next_deadline(actual + Duration::from_millis(2), Some(60.0)),
+            Some(actual + period)
+        );
+    }
+
+    #[test]
+    fn scheduler_uses_last_present_when_target_changes_or_is_reenabled() {
         let start = Instant::now();
         let mut scheduler = FrameScheduler::default();
-
-        scheduler.next_deadline(start, Some(60.0));
+        scheduler.record_present(start);
         assert_eq!(
             scheduler.next_deadline(start + Duration::from_millis(5), Some(30.0)),
-            None
+            Some(start + frame_period(30.0))
         );
         assert_eq!(
             scheduler.next_deadline(start + Duration::from_millis(10), None),
             None
         );
+        let uncapped_present = start + Duration::from_millis(11);
+        scheduler.record_present(uncapped_present);
         assert_eq!(
-            scheduler.next_deadline(start + Duration::from_millis(11), Some(30.0)),
-            None
+            scheduler.next_deadline(uncapped_present + Duration::from_millis(1), Some(30.0)),
+            Some(uncapped_present + frame_period(30.0))
         );
     }
 }

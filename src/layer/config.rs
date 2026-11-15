@@ -14,6 +14,7 @@ pub const DEFAULT_GPU_INCREASE_LIMIT: f32 = 98.0;
 pub const DEFAULT_GPU_DECREASE_LIMIT: f32 = 90.0;
 pub const DEFAULT_FRAME_JITTER_LIMIT_MS: f32 = 2.0;
 
+/// Metric an automatic algorithm regulates, with its unit and hysteresis step.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AutoMetric {
     Fps,
@@ -21,12 +22,14 @@ pub enum AutoMetric {
     FanRpm,
 }
 
+/// Value an automatic algorithm steers its metric toward: the 10% low FPS or a fixed number.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AutoTarget {
     Low10Fps,
     Value(f32),
 }
 
+/// Validated settings of one named automatic algorithm: metric, target, hysteresis, evaluation window and FPS steps and bounds.
 #[derive(Clone, Debug)]
 pub struct AutoAlgorithmConfig {
     pub name: String,
@@ -41,6 +44,7 @@ pub struct AutoAlgorithmConfig {
 }
 
 impl AutoMetric {
+    /// Returns the unit in which this metric's hysteresis is expressed.
     pub fn hysteresis_unit(self) -> &'static str {
         match self {
             Self::Fps => "FPS",
@@ -49,6 +53,7 @@ impl AutoMetric {
         }
     }
 
+    /// Returns the increment used when adjusting this metric's hysteresis.
     pub fn hysteresis_step(self) -> f32 {
         match self {
             Self::Fps | Self::GpuVrmTempC => 1.0,
@@ -56,6 +61,7 @@ impl AutoMetric {
         }
     }
 
+    /// Parses a metric name from the configuration file, returning `None` if unknown.
     fn parse(value: &str) -> Option<Self> {
         match value {
             "fps" => Some(Self::Fps),
@@ -67,6 +73,7 @@ impl AutoMetric {
 }
 
 impl AutoTarget {
+    /// Converts a settings target into an `AutoTarget`, accepting `low_10_fps` or a finite number.
     fn from_settings(target: &AutoTargetSettings) -> Option<Self> {
         match target {
             AutoTargetSettings::Metric(metric) if metric == "low_10_fps" => Some(Self::Low10Fps),
@@ -76,6 +83,7 @@ impl AutoTarget {
     }
 }
 
+/// Supported automatic algorithm types, identified by name in the configuration file.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AutoAlgorithmKind {
     GpuThreshold,
@@ -84,6 +92,7 @@ pub enum AutoAlgorithmKind {
 }
 
 impl AutoAlgorithmKind {
+    /// Parses an algorithm name from the configuration file, returning `None` if unsupported.
     fn parse(value: &str) -> Option<Self> {
         match value {
             "gpu_threshold" => Some(Self::GpuThreshold),
@@ -94,6 +103,7 @@ impl AutoAlgorithmKind {
     }
 }
 
+/// Function keys that can be bound to global shortcuts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Hotkey {
     F5,
@@ -114,8 +124,18 @@ impl Hotkey {
     }
 }
 
+/// Frame cap mode applied at startup: disabled, fixed manual target, or the automatic algorithm at the given index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartupMode {
+    Off,
+    Manual,
+    Automatic(usize),
+}
+
+/// Fully validated runtime configuration derived from the settings file.
 pub struct Config {
     pub target_fps: Option<f32>,
+    pub startup_mode: StartupMode,
     pub window_size: usize,
     pub gpu_poll_rate_ms: u64,
     pub memory_poll_rate_ms: u64,
@@ -154,6 +174,11 @@ impl Config {
     /// Loads, validates, and normalizes all runtime configuration values.
     pub fn load() -> Self {
         let (file_settings, _path, _migrated) = settings::Settings::load();
+        Self::from_settings(file_settings)
+    }
+
+    /// Validates parsed settings, logging each invalid value and substituting a default.
+    pub(super) fn from_settings(file_settings: settings::Settings) -> Self {
         let framecap = file_settings.framecap;
         let keys = file_settings.key_bindings;
         let overlay = file_settings.overlay;
@@ -214,6 +239,37 @@ impl Config {
             .find_map(|algorithm| algorithm.gpu_threshold.clone())
             .unwrap_or_default();
         let auto_algorithms = validated_auto_algorithms(auto.algorithms);
+        let legacy_mode = if target_fps.is_some() {
+            StartupMode::Manual
+        } else {
+            StartupMode::Off
+        };
+        let startup_mode = match manual.startup_mode.as_deref() {
+            None => legacy_mode,
+            Some("off") => StartupMode::Off,
+            Some("manual") if target_fps.is_some() => StartupMode::Manual,
+            Some("auto") if target_fps.is_some() => {
+                match manual.startup_algorithm.as_deref().and_then(|name| {
+                    auto_algorithms
+                        .iter()
+                        .position(|algorithm| algorithm.name == name)
+                }) {
+                    Some(index) => StartupMode::Automatic(index),
+                    None => {
+                        diagnostics::error(
+                            "Invalid [manual-mode].startup_algorithm; using legacy startup mode",
+                        );
+                        legacy_mode
+                    }
+                }
+            }
+            Some(_) => {
+                diagnostics::error(
+                    "Invalid [manual-mode].startup_mode or startup_fps; using legacy startup mode",
+                );
+                legacy_mode
+            }
+        };
         let gpu_expiry_ms = 1000;
         let (gpu_increase_limit, gpu_decrease_limit) = validated_gpu_thresholds(
             gpu_threshold_settings.gpu_increase_limit,
@@ -261,6 +317,7 @@ impl Config {
 
         Self {
             target_fps,
+            startup_mode,
             window_size,
             gpu_poll_rate_ms,
             memory_poll_rate_ms,
@@ -297,6 +354,7 @@ impl Config {
     }
 }
 
+/// Disables memory temperature polling (returns 0) for intervals below 2000 ms.
 fn validate_memory_poll_rate(value: u64) -> u64 {
     if value < 2000 {
         0
@@ -305,6 +363,7 @@ fn validate_memory_poll_rate(value: u64) -> u64 {
     }
 }
 
+/// Returns `value` if greater than zero, otherwise logs an `[overlay]` error and returns `default`.
 fn positive_u32_or_default(value: u32, name: &str, default: u32) -> u32 {
     if value > 0 {
         value
@@ -459,6 +518,7 @@ pub fn bounded_finite(value: f32, name: &str, section: &str, minimum: f32, maxim
     }
 }
 
+/// Validates each configured algorithm against the built-in defaults, skipping unknown names and falling back to the defaults if none are usable.
 fn validated_auto_algorithms(algorithms: Vec<AutoAlgorithmSettings>) -> Vec<AutoAlgorithmConfig> {
     let defaults = settings::Settings::default().auto_mode.algorithms;
     let mut validated = Vec::new();
@@ -555,6 +615,7 @@ fn validated_auto_algorithms(algorithms: Vec<AutoAlgorithmSettings>) -> Vec<Auto
     }
 }
 
+/// Converts a millisecond interval into a `Duration`, logging an error and using `default` ms if it is not positive.
 fn validated_algorithm_interval(value: u64, name: &str, section: &str, default: u64) -> Duration {
     match positive_milliseconds(value) {
         Ok(milliseconds) => Duration::from_millis(milliseconds),
@@ -702,7 +763,9 @@ mod tests {
 
     #[test]
     fn shipped_algorithms_keep_order_and_independent_settings() {
-        let config = Config::load();
+        let config = Config::from_settings(crate::layer::settings::Settings::load_from_path(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("framecap.toml"),
+        ));
         assert_eq!(config.target_fps, Some(90.0));
         assert!(config.input_enabled);
         assert_eq!(
@@ -808,7 +871,9 @@ mod tests {
 
     #[test]
     fn gpu_threshold_limits_load_from_the_algorithm_section() {
-        let config = Config::load();
+        let config = Config::from_settings(crate::layer::settings::Settings::load_from_path(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("framecap.toml"),
+        ));
         assert_eq!(config.gpu_increase_limit, 98.0);
         assert_eq!(config.gpu_decrease_limit, 90.0);
         assert_eq!(config.frame_jitter_limit_ms, 2.0);

@@ -1,5 +1,6 @@
 use crate::layer::lib::{MetricsSnapshot, TelemetryStatus};
 
+/// Text overlay settings used to display metrics.
 pub struct Overlay {
     pub color: [u8; 4],
 }

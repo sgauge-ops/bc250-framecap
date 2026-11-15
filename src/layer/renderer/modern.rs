@@ -1,7 +1,16 @@
-use super::*;
-use fontdue::{Font, FontSettings, Metrics};
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+//! Modern overlay model: a rounded dashboard drawn with the SDF background shader.
+
+use super::background::BackgroundPreparation;
+use super::canvas::{draw_rectangles, Canvas, FontFamily, FrameKey, PreparedCanvas};
+use super::format::{
+    auto_key_hints, format_auto_target, format_fps, format_memory_temperature, format_optional,
+    fps_value, frametime_value,
+};
+use super::pipeline::OverlayPipeline;
+use super::{OverlayFeedback, OverlayFrame, OverlayMode, OverlayModel, OverlayRect, OverlayStyle};
+use crate::layer::config::{AutoMetric, AutoTarget, Hotkey};
+use crate::layer::lib::{MetricsSnapshot, TelemetryStatus};
+use ash::vk;
 
 const WIDTH: u32 = 370;
 const HEIGHT: u32 = 230;
@@ -15,81 +24,47 @@ const ACCENT: usize = 2;
 const FEEDBACK: usize = 3;
 const LINE: usize = 4;
 const MODE: usize = 5;
-const COVERAGE_LEVELS: usize = 8;
-const RECTANGLES_PER_DRAW: usize = 6;
+const TITLE: usize = 6;
+const FRAMETIME: usize = 7;
+const GROUPS: usize = 8;
 
-struct Glyph {
-    metrics: Metrics,
-    spans: Vec<(u32, u32, u32, usize)>,
+/// Position of the panel in physical swapchain pixels, independent of scale.
+const ORIGIN_X: u32 = 2;
+const ORIGIN_Y: u32 = 2;
+
+// Palette, as RGB in 0..=1. The FPS value uses `[overlay].fps_color` instead.
+/// Captions, hardware labels and key hints.
+const LABEL_COLOR: [f32; 3] = [0.55, 0.62, 0.70];
+/// Measured values and settings.
+const METRIC_COLOR: [f32; 3] = [0.92, 0.94, 0.97];
+/// Horizontal section dividers.
+const BORDER_COLOR: [f32; 3] = [0.28, 0.33, 0.39];
+/// The "FRAMECAP" title.
+const TITLE_COLOR: [f32; 3] = [0.55, 0.62, 0.70];
+/// Mode badge text and outline.
+const HIGHLIGHT_COLOR: [f32; 3] = [1.0, 0.75, 0.0];
+/// Dark fill behind the mode badge text.
+const INK_COLOR: [f32; 3] = [0.18, 0.13, 0.025];
+/// Changed settings and pressed key text and outline.
+const FEEDBACK_COLOR: [f32; 3] = [1.0, 0.72, 0.20];
+const BACKGROUND_COLOR: [f32; 3] = [0.035, 0.045, 0.06];
+const PRESSED_KEY_FILL_COLOR: [f32; 3] = [0.30, 0.20, 0.08];
+const PANEL_SHADOW_COLOR: [f32; 3] = [0.0, 0.0, 0.0];
+const PANEL_BORDER_COLOR: [f32; 3] = [0.50, 0.57, 0.65];
+const KEY_FILL_COLOR: [f32; 3] = [0.15, 0.18, 0.22];
+const KEY_BORDER_COLOR: [f32; 3] = [0.38, 0.45, 0.54];
+
+/// Converts an RGB color and alpha to RGBA.
+fn rgba([red, green, blue]: [f32; 3], alpha: f32) -> [f32; 4] {
+    [red, green, blue, alpha]
 }
 
-struct FontCache {
-    regular: Font,
-    bold: Font,
-    glyphs: HashMap<(char, u32, bool), Glyph>,
-}
+/// Modern canvas: `GROUPS` color groups with `BoxStyle` boxes.
+type Dashboard = Canvas<GROUPS, BoxStyle>;
+/// Modern canvas converted for drawing at the swapchain extent.
+type PreparedDashboard = PreparedCanvas<GROUPS, BoxStyle>;
 
-impl FontCache {
-    fn new() -> Self {
-        Self {
-            regular: Font::from_bytes(
-                include_bytes!("fonts/FiraSans-Regular.ttf") as &[u8],
-                FontSettings::default(),
-            )
-            .expect("bundled regular font must be valid"),
-            bold: Font::from_bytes(
-                include_bytes!("fonts/FiraSans-Bold.ttf") as &[u8],
-                FontSettings::default(),
-            )
-            .expect("bundled bold font must be valid"),
-            glyphs: HashMap::new(),
-        }
-    }
-
-    fn glyph(&mut self, character: char, size: u32, bold: bool) -> &Glyph {
-        self.glyphs
-            .entry((character, size, bold))
-            .or_insert_with(|| {
-                let font = if bold { &self.bold } else { &self.regular };
-                let (metrics, bitmap) = font.rasterize(character, size as f32);
-                let mut spans = Vec::new();
-                for y in 0..metrics.height {
-                    let mut x = 0;
-                    while x < metrics.width {
-                        let coverage =
-                            (usize::from(bitmap[y * metrics.width + x]) * COVERAGE_LEVELS + 127)
-                                / 255;
-                        if coverage == 0 {
-                            x += 1;
-                            continue;
-                        }
-                        let start = x;
-                        while x < metrics.width
-                            && (usize::from(bitmap[y * metrics.width + x]) * COVERAGE_LEVELS + 127)
-                                / 255
-                                == coverage
-                        {
-                            x += 1;
-                        }
-                        spans.push((start as u32, y as u32, (x - start) as u32, coverage));
-                    }
-                }
-                Glyph { metrics, spans }
-            })
-    }
-}
-
-static FONTS: OnceLock<Mutex<FontCache>> = OnceLock::new();
-
-pub(super) struct Dashboard {
-    pub width: u32,
-    pub height: u32,
-    scale: u32,
-    pub groups: [Vec<OverlayRect>; 6],
-    edges: [[Vec<OverlayRect>; COVERAGE_LEVELS - 1]; 6],
-    boxes: Vec<DashboardBox>,
-}
-
+/// Rounded boxes drawn with the SDF pipeline: mode badge, idle key, and pressed key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BoxStyle {
     Mode,
@@ -97,128 +72,8 @@ enum BoxStyle {
     ActiveKey,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DashboardBox {
-    rect: OverlayRect,
-    style: BoxStyle,
-}
-
-#[derive(PartialEq)]
-pub(super) struct DashboardKey {
-    pub timestamp: Instant,
-    pub mode: OverlayMode,
-    pub target_fps: Option<f32>,
-    pub auto_algorithm_index: Option<usize>,
-    pub auto_algorithm_label: Option<String>,
-    pub hysteresis: Option<f32>,
-    pub auto_target: Option<(AutoMetric, AutoTarget)>,
-    pub hotkeys: [Hotkey; 4],
-    pub manual_step_fps: f32,
-    pub feedback: OverlayFeedback,
-}
-
-pub(super) struct PreparedDashboard {
-    width: u32,
-    height: u32,
-    scale: u32,
-    groups: [Vec<vk::ClearRect>; 6],
-    edges: [[Vec<OverlayRect>; COVERAGE_LEVELS - 1]; 6],
-    boxes: Vec<DashboardBox>,
-}
-
-fn clip_rect(rect: OverlayRect, extent: vk::Extent2D) -> Option<OverlayRect> {
-    if rect.x >= extent.width || rect.y >= extent.height {
-        return None;
-    }
-    let width = rect.width.min(extent.width - rect.x);
-    let height = rect.height.min(extent.height - rect.y);
-    if width == 0 || height == 0 {
-        return None;
-    }
-    Some(OverlayRect {
-        width,
-        height,
-        ..rect
-    })
-}
-
 impl Dashboard {
-    pub fn prepare(self, extent: vk::Extent2D) -> PreparedDashboard {
-        let convert = |rectangles: Vec<OverlayRect>| {
-            rectangles
-                .into_iter()
-                .filter_map(|rect| clip_rect(rect, extent))
-                .map(|rect| {
-                    vk::ClearRect::default()
-                        .rect(
-                            vk::Rect2D::default()
-                                .offset(vk::Offset2D {
-                                    x: rect.x as i32,
-                                    y: rect.y as i32,
-                                })
-                                .extent(vk::Extent2D {
-                                    width: rect.width,
-                                    height: rect.height,
-                                }),
-                        )
-                        .base_array_layer(0)
-                        .layer_count(1)
-                })
-                .collect()
-        };
-        let groups = self.groups.map(convert);
-        let edges = self.edges.map(|levels| {
-            levels.map(|rectangles| {
-                rectangles
-                    .into_iter()
-                    .filter_map(|rect| clip_rect(rect, extent))
-                    .collect()
-            })
-        });
-        PreparedDashboard {
-            width: self.width,
-            height: self.height,
-            scale: self.scale,
-            groups,
-            edges,
-            boxes: self.boxes,
-        }
-    }
-
-    fn rect(&mut self, group: usize, x: u32, y: u32, width: u32, height: u32) {
-        self.groups[group].push(OverlayRect {
-            x: x * self.scale,
-            y: y * self.scale,
-            width: width * self.scale,
-            height: height * self.scale,
-        });
-    }
-
-    fn styled_box(&mut self, x: u32, y: u32, width: u32, height: u32, style: BoxStyle) {
-        self.boxes.push(DashboardBox {
-            rect: OverlayRect {
-                x: x * self.scale,
-                y: y * self.scale,
-                width: width * self.scale,
-                height: height * self.scale,
-            },
-            style,
-        });
-    }
-
-    fn text(
-        &mut self,
-        text: &str,
-        x: u32,
-        y: u32,
-        size: u32,
-        width: u32,
-        bold: bool,
-        group: usize,
-    ) -> u32 {
-        self.draw_text(text, x, y, size, width, bold, group, false, false)
-    }
-
+    /// Draws bold baseline-aligned sensor text; labels use a smaller size and values are right-aligned.
     fn hardware_text(&mut self, text: &str, x: u32, y: u32, width: u32, group: usize) {
         let size = if group == LABEL {
             HARDWARE_LABEL_SIZE
@@ -237,86 +92,10 @@ impl Dashboard {
             group == VALUE,
         );
     }
-
-    fn draw_text(
-        &mut self,
-        text: &str,
-        x: u32,
-        y: u32,
-        size: u32,
-        width: u32,
-        bold: bool,
-        group: usize,
-        align_baseline: bool,
-        align_right: bool,
-    ) -> u32 {
-        let mut cache = FONTS
-            .get_or_init(|| Mutex::new(FontCache::new()))
-            .lock()
-            .expect("font cache poisoned");
-        let x = x * self.scale;
-        let y = y * self.scale;
-        let width = width * self.scale;
-        let mut size = size * self.scale;
-        let baseline = y + size;
-        let min_size = 8 * self.scale;
-        let text_width = |cache: &mut FontCache, text: &str, size| {
-            text.chars()
-                .map(|c| cache.glyph(c, size, bold).metrics.advance_width)
-                .sum::<f32>()
-        };
-        while size > min_size && text_width(&mut cache, text, size) > width as f32 {
-            size -= self.scale;
-        }
-        let mut visible = text.to_owned();
-        if text_width(&mut cache, &visible, size) > width as f32 {
-            while !visible.is_empty()
-                && text_width(&mut cache, &format!("{visible}…"), size) > width as f32
-            {
-                visible.pop();
-            }
-            visible.push('…');
-        }
-        let limit = x.saturating_add(width);
-        let mut cursor = if align_right {
-            (limit as f32 - text_width(&mut cache, &visible, size)).max(x as f32)
-        } else {
-            x as f32
-        };
-        let mut right = x;
-        let baseline = if align_baseline { baseline } else { y + size };
-        for character in visible.chars() {
-            let glyph = cache.glyph(character, size, bold);
-            let gx = cursor.round() as i32 + glyph.metrics.xmin;
-            let gy = baseline as i32 - glyph.metrics.height as i32 - glyph.metrics.ymin;
-            for &(dx, dy, span_width, coverage) in &glyph.spans {
-                let left = gx + dx as i32;
-                let top = gy + dy as i32;
-                if left >= x as i32 && top >= 0 && left < limit as i32 {
-                    let rect = OverlayRect {
-                        x: left as u32,
-                        y: top as u32,
-                        width: span_width.min(limit - left as u32),
-                        height: 1,
-                    };
-                    right = right.max(rect.x + rect.width);
-                    if coverage == COVERAGE_LEVELS {
-                        self.groups[group].push(rect);
-                    } else {
-                        self.edges[group][coverage - 1].push(rect);
-                    }
-                }
-            }
-            cursor += glyph.metrics.advance_width;
-            if cursor >= limit as f32 {
-                break;
-            }
-        }
-        right.div_ceil(self.scale)
-    }
 }
 
 impl PreparedDashboard {
+    /// Draws the shadowed panel, its border, the rounded boxes, then every text color group.
     pub fn draw(
         &self,
         device: &ash::Device,
@@ -326,6 +105,7 @@ impl PreparedDashboard {
         pipeline_layout: vk::PipelineLayout,
         opacity: f32,
         fps_color: [u8; 3],
+        capture_active: bool,
     ) {
         if extent.width == 0 || extent.height == 0 {
             return;
@@ -337,8 +117,8 @@ impl PreparedDashboard {
             device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline)
         };
         let panel = OverlayRect {
-            x: 0,
-            y: 0,
+            x: ORIGIN_X,
+            y: ORIGIN_Y,
             width: panel_width,
             height: panel_height,
         };
@@ -354,7 +134,7 @@ impl PreparedDashboard {
                 pipeline_layout,
                 extent,
                 &[shadow],
-                [0.0, 0.0, 0.0, opacity * 0.3],
+                rgba(PANEL_SHADOW_COLOR, opacity * 0.3),
                 10.0 * scale as f32,
                 0.0,
             );
@@ -364,7 +144,7 @@ impl PreparedDashboard {
                 pipeline_layout,
                 extent,
                 &[panel],
-                [0.035, 0.045, 0.06, opacity.clamp(0.0, 1.0)],
+                rgba(BACKGROUND_COLOR, opacity.clamp(0.0, 1.0)),
                 9.0 * scale as f32,
                 -1.0,
             );
@@ -375,15 +155,19 @@ impl PreparedDashboard {
             pipeline_layout,
             extent,
             &[panel],
-            [0.50, 0.57, 0.65, 0.9],
+            rgba(PANEL_BORDER_COLOR, 0.9),
             9.0 * scale as f32,
             1.2 * scale as f32,
         );
         for item in &self.boxes {
             let (fill, stroke, radius) = match item.style {
-                BoxStyle::Mode => ([0.18, 0.13, 0.025, 0.75], [1.0, 0.75, 0.0, 1.0], 11.0),
-                BoxStyle::Key => ([0.15, 0.18, 0.22, 0.9], [0.38, 0.45, 0.54, 1.0], 5.0),
-                BoxStyle::ActiveKey => ([0.30, 0.20, 0.08, 0.9], [1.0, 0.72, 0.20, 1.0], 5.0),
+                BoxStyle::Mode => (rgba(INK_COLOR, 0.75), rgba(HIGHLIGHT_COLOR, 1.0), 11.0),
+                BoxStyle::Key => (rgba(KEY_FILL_COLOR, 0.9), rgba(KEY_BORDER_COLOR, 1.0), 5.0),
+                BoxStyle::ActiveKey => (
+                    rgba(PRESSED_KEY_FILL_COLOR, 0.9),
+                    rgba(FEEDBACK_COLOR, 1.0),
+                    5.0,
+                ),
             };
             draw_rectangles(
                 device,
@@ -408,86 +192,28 @@ impl PreparedDashboard {
         }
         let [red, green, blue] = fps_color.map(|channel| f32::from(channel) / 255.0);
         let colors = [
-            [0.55, 0.62, 0.70, 1.0],
-            [0.92, 0.94, 0.97, 1.0],
+            rgba(LABEL_COLOR, 1.0),
+            rgba(METRIC_COLOR, 1.0),
             [red, green, blue, 1.0],
-            [1.0, 0.72, 0.20, 1.0],
-            [0.28, 0.33, 0.39, 1.0],
-            [1.0, 0.75, 0.0, 1.0],
+            rgba(FEEDBACK_COLOR, 1.0),
+            rgba(BORDER_COLOR, 1.0),
+            rgba(HIGHLIGHT_COLOR, 1.0),
+            rgba(TITLE_COLOR, 1.0),
+            rgba(
+                if capture_active {
+                    [1.0, 0.15, 0.15]
+                } else {
+                    METRIC_COLOR
+                },
+                1.0,
+            ),
         ];
-        for (group, (rectangles, color)) in self.groups.iter().zip(colors).enumerate() {
-            if !rectangles.is_empty() {
-                let attachment = [vk::ClearAttachment::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .color_attachment(0)
-                    .clear_value(vk::ClearValue {
-                        color: vk::ClearColorValue { float32: color },
-                    })];
-                unsafe { device.cmd_clear_attachments(command_buffer, &attachment, rectangles) };
-            }
-            for (index, edges) in self.edges[group].iter().enumerate() {
-                let mut color = color;
-                color[3] = (index + 1) as f32 / COVERAGE_LEVELS as f32;
-                for chunk in edges.chunks(RECTANGLES_PER_DRAW) {
-                    draw_rectangles(
-                        device,
-                        command_buffer,
-                        pipeline_layout,
-                        extent,
-                        chunk,
-                        color,
-                        0.0,
-                        0.0,
-                    );
-                }
-            }
-        }
+        self.draw_groups(device, command_buffer, extent, pipeline_layout, colors);
     }
 }
 
-fn draw_rectangles(
-    device: &ash::Device,
-    command_buffer: vk::CommandBuffer,
-    pipeline_layout: vk::PipelineLayout,
-    extent: vk::Extent2D,
-    rectangles: &[OverlayRect],
-    color: [f32; 4],
-    radius: f32,
-    border: f32,
-) {
-    debug_assert!(!rectangles.is_empty() && rectangles.len() <= RECTANGLES_PER_DRAW);
-    let mut constants = [0.0f32; 32];
-    for (index, rect) in rectangles.iter().enumerate() {
-        let x = rect.x as f32;
-        let y = rect.y as f32;
-        constants[index * 4..index * 4 + 4].copy_from_slice(&[
-            2.0 * x / extent.width as f32 - 1.0,
-            2.0 * y / extent.height as f32 - 1.0,
-            2.0 * (x + rect.width as f32) / extent.width as f32 - 1.0,
-            2.0 * (y + rect.height as f32) / extent.height as f32 - 1.0,
-        ]);
-    }
-    constants[24..28].copy_from_slice(&color);
-    constants[28..32].copy_from_slice(&[extent.width as f32, extent.height as f32, radius, border]);
-    let bytes = unsafe {
-        std::slice::from_raw_parts(
-            constants.as_ptr().cast::<u8>(),
-            std::mem::size_of_val(&constants),
-        )
-    };
-    unsafe {
-        device.cmd_push_constants(
-            command_buffer,
-            pipeline_layout,
-            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-            0,
-            bytes,
-        );
-        device.cmd_draw(command_buffer, 6, rectangles.len() as u32, 0, 0);
-    }
-}
-
-pub(super) fn scale_for(mode: OverlayMode, extent: vk::Extent2D, threshold: u32) -> u32 {
+/// Picks 2× scale when the extent reaches the threshold and fits the doubled panel, otherwise 1×.
+fn scale_for(mode: OverlayMode, extent: vk::Extent2D, threshold: u32) -> u32 {
     let (width, height) = if mode == OverlayMode::Full {
         (WIDTH, HEIGHT)
     } else {
@@ -500,7 +226,8 @@ pub(super) fn scale_for(mode: OverlayMode, extent: vk::Extent2D, threshold: u32)
     }
 }
 
-pub(super) fn layout(
+/// Lays out the whole panel (compact or full) for the frame at the given scale.
+fn layout(
     metrics: &MetricsSnapshot,
     mode: OverlayMode,
     target_fps: Option<f32>,
@@ -514,15 +241,13 @@ pub(super) fn layout(
     scale: u32,
 ) -> Dashboard {
     let full = mode == OverlayMode::Full;
-    let mut dashboard = Dashboard {
-        width: if full { WIDTH } else { 142 },
-        height: if full { HEIGHT } else { 62 },
+    let mut dashboard = Dashboard::new(
+        if full { WIDTH } else { 142 },
+        if full { HEIGHT } else { 62 },
         scale,
-        groups: std::array::from_fn(|_| Vec::new()),
-        edges: std::array::from_fn(|_| std::array::from_fn(|_| Vec::new())),
-        boxes: Vec::new(),
-    };
-    let fps = Renderer::fps_value(metrics);
+        FontFamily::Sans,
+    );
+    let fps = fps_value(metrics);
     if !full {
         dashboard.text("FPS", 12, 8, 12, 110, false, LABEL);
         dashboard.text(
@@ -536,7 +261,7 @@ pub(super) fn layout(
         );
         return dashboard;
     }
-    dashboard.text("FRAMECAP", 16, 8, 12, 120, true, LABEL);
+    dashboard.text("FRAMECAP", 16, 8, 12, 120, true, TITLE);
     let fps_right = dashboard.text(
         &fps,
         16,
@@ -553,15 +278,13 @@ pub(super) fn layout(
     } else {
         "COLLECT".to_owned()
     };
-    let jitter = metrics.jitter_ms();
-    let jitter = if jitter.is_finite() && jitter >= 0.0 {
-        format!("{jitter:.1} ms")
-    } else {
-        "COLLECT".to_owned()
-    };
-    for (x, width, label, value) in [(150, 104, "10% LOW", low), (258, 96, "JITTER", jitter)] {
+    let frametime = frametime_value(metrics);
+    for (x, width, label, value, group) in [
+        (150, 104, "10% LOW", low, VALUE),
+        (258, 96, "FRAMETIME", frametime, FRAMETIME),
+    ] {
         dashboard.text(label, x, 26, 12, width, true, LABEL);
-        dashboard.text(&value, x, 42, 18, width, true, VALUE);
+        dashboard.text(&value, x, 42, 18, width, true, group);
     }
     dashboard.rect(LINE, 16, 70, WIDTH - 32, 1);
     let mode_label = match (target_fps, auto_algorithm_label) {
@@ -775,9 +498,119 @@ pub(super) fn layout(
     dashboard
 }
 
+/// Spawns the modern-overlay worker, which lays out each frame for the extent.
+fn background_modern(
+    extent: vk::Extent2D,
+    threshold: u32,
+) -> std::io::Result<BackgroundPreparation<PreparedDashboard>> {
+    BackgroundPreparation::new("modern", move |frame| {
+        layout(
+            frame.metrics,
+            frame.mode,
+            frame.target_fps,
+            frame.auto_algorithm_index,
+            frame.auto_algorithm_label,
+            frame.hysteresis,
+            frame.auto_target,
+            frame.hotkeys,
+            frame.manual_step_fps,
+            frame.feedback,
+            scale_for(frame.mode, extent, threshold),
+        )
+        .prepare(extent)
+    })
+}
+
+/// Modern overlay model: owns the pipeline and the background-prepared dashboard.
+pub(super) struct ModernModel {
+    extent: vk::Extent2D,
+    background_opacity: f32,
+    fps_color: [u8; 3],
+    scale_2x_min_width_px: u32,
+    pipeline: OverlayPipeline,
+    background: Option<BackgroundPreparation<PreparedDashboard>>,
+    worker_failed: bool,
+    dashboard: Option<(FrameKey, OverlayMode, PreparedDashboard)>,
+}
+
+impl OverlayModel for ModernModel {
+    /// Creates the model and its dashboard-shader pipeline.
+    fn new(
+        device: &ash::Device,
+        render_pass: vk::RenderPass,
+        style: OverlayStyle,
+    ) -> Result<Self, vk::Result> {
+        let pipeline = OverlayPipeline::new(
+            device,
+            render_pass,
+            style.extent,
+            include_bytes!("../shaders/dashboard.vert.spv"),
+            include_bytes!("../shaders/dashboard.frag.spv"),
+            128,
+        )?;
+        Ok(Self {
+            extent: style.extent,
+            background_opacity: style.background_opacity,
+            fps_color: style.fps_color,
+            scale_2x_min_width_px: style.scale_2x_min_width_px,
+            pipeline,
+            background: None,
+            worker_failed: false,
+            dashboard: None,
+        })
+    }
+
+    /// Starts the worker if needed, collects the prepared dashboard, and draws it when the mode matches.
+    fn record(
+        &mut self,
+        device: &ash::Device,
+        command_buffer: vk::CommandBuffer,
+        frame: &OverlayFrame<'_>,
+    ) {
+        if self.background.is_none() && !self.worker_failed {
+            match background_modern(self.extent, self.scale_2x_min_width_px) {
+                Ok(background) => self.background = Some(background),
+                Err(error) => {
+                    crate::layer::diagnostics::error(format!(
+                        "failed to start modern overlay preparation worker: {error}"
+                    ));
+                    self.worker_failed = true;
+                }
+            }
+        }
+        if let Some(background) = self.background.as_mut() {
+            background.update(frame, &mut self.dashboard);
+        }
+        let Some((_, mode, dashboard)) = &self.dashboard else {
+            return;
+        };
+        if *mode != frame.mode {
+            return;
+        }
+        dashboard.draw(
+            device,
+            command_buffer,
+            self.extent,
+            self.pipeline.pipeline,
+            self.pipeline.layout,
+            self.background_opacity,
+            self.fps_color,
+            crate::layer::capture::is_active(),
+        );
+    }
+
+    /// Releases the Vulkan pipeline resources.
+    fn destroy(&self, device: &ash::Device) {
+        self.pipeline.destroy(device);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layer::lib::{GpuMeasurement, HardwareMetrics, MemoryTemperature};
+    use crate::layer::renderer::canvas::{clip_rect, FontCache, COVERAGE_LEVELS};
+    use std::time::Instant;
 
     const KEYS: [Hotkey; 4] = [Hotkey::F5, Hotkey::F7, Hotkey::F6, Hotkey::F8];
 
@@ -799,6 +632,46 @@ mod tests {
         )
     }
 
+    #[test]
+    fn modern_prepares_full_and_compact_layouts_in_the_background() {
+        let extent = vk::Extent2D {
+            width: 1920,
+            height: 1080,
+        };
+        let metrics = snapshot(60.0, HardwareMetrics::default(), TelemetryStatus::Available);
+        let mut frame = OverlayFrame {
+            metrics: &metrics,
+            mode: OverlayMode::Full,
+            target_fps: Some(60.0),
+            auto_algorithm_index: None,
+            auto_algorithm_label: None,
+            hysteresis: None,
+            auto_target: None,
+            hotkeys: KEYS,
+            manual_step_fps: 5.0,
+            feedback: OverlayFeedback::default(),
+        };
+        let mut worker = background_modern(extent, 3840).unwrap();
+        let mut prepared = None;
+        worker.update(&frame, &mut prepared);
+        assert!(prepared.is_none());
+        for mode in [OverlayMode::Full, OverlayMode::Fps] {
+            frame.mode = mode;
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            while !prepared
+                .as_ref()
+                .is_some_and(|(_, result_mode, _)| *result_mode == mode)
+                && Instant::now() < deadline
+            {
+                worker.update(&frame, &mut prepared);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let (_, result_mode, dashboard) = prepared.as_ref().unwrap();
+            assert_eq!(*result_mode, mode);
+            assert!(!dashboard.groups.iter().all(Vec::is_empty));
+        }
+    }
+
     fn assert_text(
         dashboard: &Dashboard,
         text: &str,
@@ -808,14 +681,7 @@ mod tests {
         width: u32,
         group: usize,
     ) {
-        let mut reference = Dashboard {
-            width: WIDTH,
-            height: HEIGHT,
-            scale: dashboard.scale,
-            groups: std::array::from_fn(|_| Vec::new()),
-            edges: std::array::from_fn(|_| std::array::from_fn(|_| Vec::new())),
-            boxes: Vec::new(),
-        };
+        let mut reference = Dashboard::new(WIDTH, HEIGHT, dashboard.scale, FontFamily::Sans);
         if group == VALUE && size == HARDWARE_TEXT_SIZE && (111..=174).contains(&y) {
             reference.hardware_text(text, x, y, width, group);
         } else {
@@ -879,9 +745,11 @@ mod tests {
         );
         assert_eq!((dashboard.width, dashboard.height), (370, 230));
         for (text, x, y, size, width, group) in [
+            ("FRAMECAP", 16, 8, 12, 120, TITLE),
             ("60", 16, 24, 36, FPS_VALUE_WIDTH, ACCENT),
             ("55 FPS", 150, 42, 18, 104, VALUE),
-            ("0.5 ms", 258, 42, 18, 96, VALUE),
+            ("FRAMETIME", 258, 26, 12, 96, LABEL),
+            ("16.00 ms", 258, 42, 18, 96, FRAMETIME),
             ("AUTO · JIT", 22, 78, 13, 92, MODE),
             ("60 FPS", 128, 88, 14, 68, FEEDBACK),
             ("5.0 FPS", 196, 88, 14, 56, FEEDBACK),
@@ -1181,14 +1049,7 @@ mod tests {
             ("+100 FPS", 11, 50),
         ] {
             for scale in [1, 2] {
-                let make_dashboard = || Dashboard {
-                    width: WIDTH,
-                    height: HEIGHT,
-                    scale,
-                    groups: std::array::from_fn(|_| Vec::new()),
-                    edges: std::array::from_fn(|_| std::array::from_fn(|_| Vec::new())),
-                    boxes: Vec::new(),
-                };
+                let make_dashboard = || Dashboard::new(WIDTH, HEIGHT, scale, FontFamily::Sans);
                 let mut constrained = make_dashboard();
                 let mut unconstrained = make_dashboard();
                 constrained.text(text, 16, 27, size, width, true, VALUE);
@@ -1251,14 +1112,7 @@ mod tests {
     #[test]
     fn reduced_hardware_text_keeps_its_baseline() {
         for scale in [1, 2] {
-            let make_dashboard = || Dashboard {
-                width: WIDTH,
-                height: HEIGHT,
-                scale,
-                groups: std::array::from_fn(|_| Vec::new()),
-                edges: std::array::from_fn(|_| std::array::from_fn(|_| Vec::new())),
-                boxes: Vec::new(),
-            };
+            let make_dashboard = || Dashboard::new(WIDTH, HEIGHT, scale, FontFamily::Sans);
             for group in [LABEL, VALUE] {
                 let mut actual = make_dashboard();
                 actual.hardware_text("1240 RPM", 16, 27, 45, group);
@@ -1296,7 +1150,7 @@ mod tests {
 
     #[test]
     fn compact_hardware_values_fit_without_ellipsis() {
-        let mut cache = FontCache::new();
+        let mut cache = FontCache::new(FontFamily::Sans);
         for scale in [1, 2] {
             for (text, width) in [
                 (">=120 °C", 46),
@@ -1329,14 +1183,7 @@ mod tests {
                 (152, "1 / 9 MB", "512 / 12000 MB"),
             ] {
                 let render = |text| {
-                    let mut dashboard = Dashboard {
-                        width: WIDTH,
-                        height: HEIGHT,
-                        scale,
-                        groups: std::array::from_fn(|_| Vec::new()),
-                        edges: std::array::from_fn(|_| std::array::from_fn(|_| Vec::new())),
-                        boxes: Vec::new(),
-                    };
+                    let mut dashboard = Dashboard::new(WIDTH, HEIGHT, scale, FontFamily::Sans);
                     dashboard.hardware_text(text, 70, 111, width, VALUE);
                     dashboard
                 };
@@ -1377,14 +1224,7 @@ mod tests {
                 ("4000 MB", 275, 67, 275, 53, 14),
             ] {
                 let right_edge = |x, width| {
-                    let mut dashboard = Dashboard {
-                        width: WIDTH,
-                        height: HEIGHT,
-                        scale,
-                        groups: std::array::from_fn(|_| Vec::new()),
-                        edges: std::array::from_fn(|_| std::array::from_fn(|_| Vec::new())),
-                        boxes: Vec::new(),
-                    };
+                    let mut dashboard = Dashboard::new(WIDTH, HEIGHT, scale, FontFamily::Sans);
                     dashboard.hardware_text(text, x, 111, width, VALUE);
                     dashboard.groups[VALUE]
                         .iter()
@@ -1469,14 +1309,7 @@ mod tests {
                 (104, "-25 FPS", 192),
                 (192, "+25 FPS", 280),
             ] {
-                let mut reference = Dashboard {
-                    width: WIDTH,
-                    height: HEIGHT,
-                    scale,
-                    groups: std::array::from_fn(|_| Vec::new()),
-                    edges: std::array::from_fn(|_| std::array::from_fn(|_| Vec::new())),
-                    boxes: Vec::new(),
-                };
+                let mut reference = Dashboard::new(WIDTH, HEIGHT, scale, FontFamily::Sans);
                 reference.text(action, x + 36, 203, 11, 50, true, LABEL);
                 assert!(reference.groups[LABEL]
                     .iter()
@@ -1619,7 +1452,7 @@ mod tests {
 
     #[test]
     fn glyph_cache_preserves_quantized_coverage_at_both_scales() {
-        let mut cache = FontCache::new();
+        let mut cache = FontCache::new(FontFamily::Sans);
         for size in [36, 72] {
             let (_, bitmap) = cache.bold.rasterize('6', size as f32);
             let mut expected = [0usize; COVERAGE_LEVELS + 1];

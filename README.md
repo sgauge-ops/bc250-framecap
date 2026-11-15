@@ -5,22 +5,27 @@ FrameCap is a Linux Vulkan layer that provides an overlay with manual or experim
 FrameCap has been developped and validated with a bc250 mining board running CachyOS with [bc250 kernel](https://github.com/MastaG/linux-cachyos-bc250) and [cyan-skillfish governor](https://github.com/filippor/cyan-skillfish-governor).
 Any other configuration is unknown at the moment.
 
-FrameCap offers the following modes, that can be cycled-through via [F5] (by default):
+FrameCap offers the following modes, that can be cycled-through with a short [F5] press (by default):
 | mode | description | default (*) |
 | --- | --- | --- |
 | OFF | Overlay only, no frame capping | -- |
-| MANUAL | User defined frame capping, use [F6] and [F7] respectively decrease and increase frame cap | 90 fps target |
+| MANUAL | User defined frame capping, use [F6] and [F7] respectively decrease and increase frame cap | 60 fps target |
 | AUTO (JIT) | Adjusts the cap using 10%-low FPS, GPU load and jitter; [F6] and [F7] adjust the hysteresis in FPS | 5 fps hysteresis |
 | AUTO (VRM) | Adjusts the cap around a VRM temperature target; [F6] and [F7] adjust the target by the hysteresis in °C | 5°C hysteresis |
 | AUTO (FAN) | Adjusts the cap around a fan-speed target; [F6] and [F7] adjust the target by the hysteresis in RPM | 50 rpm hysteresis |
 
-(*) Default settings can be configured in `framecap.toml`.
+(*) Defaults are stored in `~/.config/framecap.toml`. Shortcut changes, including
+the current regulation mode, are saved for the next launch.
 
 See [automatic regulation](documentation/AUTO-MODE.md) for the rules and limitations. The algorithms are still experimental and being fine-tuned. Your feedback is welcome.
 
 A short [F8] press cycles the overlay through full, FPS only, and off.
 
-Holding [F8] for one second switches between the `modern` and `ascii` renderers. Background logic remains active when the overlay is hidden.
+Holding [F8] for one second cycles through the `ascii`, `modern` and `helix` renderers. Background logic remains active when the overlay is hidden.
+
+Holding the physical [F5] key for one second starts a 30-second frametime
+diagnostic capture without changing the mode. See
+[capture instructions](documentation/CONFIGURATION.md#frametime-capture).
 
 # Short installation guide
 
@@ -36,8 +41,8 @@ curl -fL https://github.com/sgauge-ops/bc250-framecap/releases/latest/download/f
 ```
 
 The archive contains the Vulkan layer manifest, release library, and an example
-configuration. It does not replace a local `framecap.toml`; FrameCap uses
-built-in defaults if no configuration file exists. This binary targets 64-bit
+configuration. If the user configuration does not exist, FrameCap creates
+`~/.config/framecap.toml` with its built-in defaults. This binary targets 64-bit
 x86 Linux with glibc 2.35 or newer. Other architectures and native Wayland
 shortcuts are not supported by this binary.
 
@@ -50,16 +55,16 @@ sudo reboot
 
 ## Configure
 
-To start with the example configuration, copy it once to `~/.config/` directory to
-make it globally available, and review its machine-specific sensor overrides:
+To start with the example configuration instead of the built-in defaults, copy
+it before launching FrameCap and review its machine-specific sensor overrides:
 
 ```sh
 mkdir -p "$HOME/.config" ;
 cp -n "$HOME/bc250-framecap/framecap.toml.example" "$HOME/.config/framecap.toml" ;
-ln -sT "$HOME/.config/framecap.toml" "$HOME/bc250-framecap/framecap.toml"
 ```
 
-Edit `$HOME/bc250-framecap/framecap.toml` and adjust your preferences.
+Edit `$HOME/.config/framecap.toml` and adjust your preferences. An existing
+file in the game directory or `XDG_CONFIG_HOME` no longer overrides it.
 
 ## Test with vkcube & furmark
 

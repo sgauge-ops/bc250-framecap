@@ -41,9 +41,9 @@ release library in `lib/`. Extraction updates those files without replacing a
 local `framecap.toml`.
 
 It also includes `framecap.toml.example`; copy that file
-to `~/.config/framecap.toml` if you want to configure the layer, then review its
-machine-specific sensor selectors. If no configuration exists, Framecap uses
-its built-in defaults.
+to `~/.config/framecap.toml` before first launch if you want to use it, then
+review its machine-specific sensor selectors. Otherwise Framecap creates a
+user configuration with its built-in defaults.
 
 The archive also includes executable `test-vkcube.sh` and `test-furmark.sh` scripts.
 
@@ -67,25 +67,23 @@ longer discoverable.
 
 ## Configure
 
-Edit `$HOME/bc250-framecap/framecap.toml` for your machine. To make this
-configuration available to games launched from other directories, create a
-symbolic link in the configuration directory searched by Framecap:
+To use the source checkout's example rather than the built-in defaults, copy it
+to the user configuration before launching Framecap:
 
 ```sh
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}"
-mkdir -p "$CONFIG_DIR"
-ln -sT "$HOME/bc250-framecap/framecap.toml" "$CONFIG_DIR/framecap.toml"
+mkdir -p "$HOME/.config"
+cp -n "$HOME/bc250-framecap/framecap.toml" "$HOME/.config/framecap.toml"
 ```
 
-The link command does not overwrite an existing configuration. If the
-destination already exists, review it and decide how to migrate it before
-creating the link. Use the same `XDG_CONFIG_HOME` as the Steam process; if it
-is unset, Framecap searches `$HOME/.config`.
+The copy does not overwrite an existing configuration. If the destination
+already exists, review it and decide how to migrate your settings. Existing
+symbolic links at that location remain supported.
 
 The example contains machine-specific sensor overrides and values that differ
 from the built-in defaults. Review or remove the `[sensors]` overrides before
-use; selectors are specific to the machine. A `framecap.toml` in the game's working
-directory takes precedence over the link. See [configuration](CONFIGURATION.md).
+use; selectors are specific to the machine. The global configuration takes
+precedence over files in the game's working directory and `XDG_CONFIG_HOME`.
+See [configuration](CONFIGURATION.md).
 
 ## Activate for a Steam game
 
@@ -134,7 +132,7 @@ For automated checks, run `cargo build --locked && cargo test --locked`. The
 ## Uninstall
 
 Remove the Steam launch options and, if no longer needed, delete
-`$HOME/bc250-framecap` and its configuration link in `$XDG_CONFIG_HOME` or
-`$HOME/.config`. Verify that the link points to the installation before
-removing it. Remove the diagnostics log separately if desired. Framecap does
+`$HOME/bc250-framecap` and `$HOME/.config/framecap.toml`. If the latter is a
+symbolic link, check its destination before removing it. Remove the diagnostics
+log separately if desired. Framecap does
 not install a global Vulkan manifest.

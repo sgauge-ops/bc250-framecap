@@ -3,12 +3,14 @@ use crate::layer::lib::{GpuMeasurement, HardwareMetrics, MetricsSnapshot, Teleme
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+/// Timestamped scalar telemetry value stored in a rolling window.
 #[derive(Clone, Copy)]
 struct Sample {
     timestamp: Instant,
     value: f32,
 }
 
+/// Frametime and instantaneous FPS derived from the interval between two presentations.
 #[derive(Clone, Copy)]
 struct PresentationSample {
     timestamp: Instant,
@@ -256,6 +258,7 @@ impl AutoMetricsHistory {
         ))
     }
 
+    /// Appends a sample unless its timestamp is not newer, restarting the window after a gap longer than it.
     fn record_sample(
         samples: &mut VecDeque<Sample>,
         since: &mut Option<Instant>,
@@ -280,6 +283,7 @@ impl AutoMetricsHistory {
         true
     }
 
+    /// Appends a presentation sample unless its timestamp is not newer, restarting the window after a gap longer than it.
     fn record_presentation(
         samples: &mut VecDeque<PresentationSample>,
         since: &mut Option<Instant>,
@@ -304,6 +308,7 @@ impl AutoMetricsHistory {
         true
     }
 
+    /// Drops samples that are in the future or older than the window.
     fn evict(
         samples: &mut VecDeque<Sample>,
         since: &mut Option<Instant>,
@@ -320,6 +325,7 @@ impl AutoMetricsHistory {
         }
     }
 
+    /// Drops stale or future presentation samples and resets them if the clock went backwards.
     fn evict_presentations(&mut self, now: Instant) {
         while self.presentations.front().is_some_and(|sample| {
             sample.timestamp > now || now.saturating_duration_since(sample.timestamp) > self.window
@@ -336,6 +342,7 @@ impl AutoMetricsHistory {
         }
     }
 
+    /// Returns whether samples span a full window and the latest one is still fresh.
     fn complete_samples(
         &self,
         samples: &VecDeque<Sample>,
@@ -349,6 +356,7 @@ impl AutoMetricsHistory {
         })
     }
 
+    /// Returns whether presentation samples span a full window and the latest one is still fresh.
     fn complete_presentations(&self, now: Instant) -> bool {
         self.presentations_since
             .zip(self.presentations.back())
@@ -359,6 +367,7 @@ impl AutoMetricsHistory {
             })
     }
 
+    /// Returns the arithmetic mean of the sample values; `samples` must not be empty.
     fn average(samples: &VecDeque<Sample>) -> f32 {
         (samples
             .iter()
@@ -367,6 +376,7 @@ impl AutoMetricsHistory {
             / samples.len() as f64) as f32
     }
 
+    /// Returns the population standard deviation of frametimes in the window, in milliseconds.
     fn jitter_ms(&self) -> f32 {
         let count = self.presentations.len() as f64;
         let mean = self
@@ -384,6 +394,7 @@ impl AutoMetricsHistory {
         variance.sqrt() as f32
     }
 
+    /// Returns the 10th-percentile instantaneous FPS of the window.
     fn low_10_fps(&self) -> f32 {
         let mut values = self
             .presentations

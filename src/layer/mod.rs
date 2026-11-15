@@ -1,13 +1,16 @@
 pub mod auto;
 mod auto_metrics;
+mod capture;
 pub mod config;
 pub mod diagnostics;
+mod gpu_capture;
 pub mod input_x11;
 pub mod lib;
 pub mod limiter;
 pub mod memory_temperature;
 pub mod metrics;
 pub mod overlay;
+mod persistence;
 pub mod renderer;
 pub mod settings;
 pub mod telemetry;

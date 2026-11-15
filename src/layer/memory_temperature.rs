@@ -4,16 +4,19 @@ use std::path::Path;
 
 const HWMON_ROOT: &str = "/sys/class/hwmon";
 
+/// VRAM hotspot temperature in °C; `saturated` is set when the sensor reports its 120 °C maximum.
 #[derive(Debug, PartialEq)]
 pub struct Hotspot {
     pub temperature_c: i32,
     pub saturated: bool,
 }
 
+/// Reads the bc250_memory VRAM hotspot temperature from `/sys/class/hwmon`.
 pub fn read_hotspot() -> Result<Hotspot> {
     read_hotspot_from(Path::new(HWMON_ROOT))
 }
 
+/// Finds the single `bc250_memory` "VRAM Hotspot" sensor under `root` and parses its input; errors if none or several match.
 fn read_hotspot_from(root: &Path) -> Result<Hotspot> {
     let mut matches = Vec::new();
     for entry in fs::read_dir(root).with_context(|| format!("cannot read {}", root.display()))? {
@@ -63,6 +66,7 @@ fn read_hotspot_from(root: &Path) -> Result<Hotspot> {
     parse_hotspot(&value).with_context(|| format!("invalid reading from {}", path.display()))
 }
 
+/// Parses a millidegree reading, accepting only valid 2 °C JEDEC steps from -40 °C to 120 °C.
 fn parse_hotspot(value: &str) -> Result<Hotspot> {
     let millidegrees: i32 = value
         .trim()

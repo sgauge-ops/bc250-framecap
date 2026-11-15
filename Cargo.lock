@@ -155,6 +155,7 @@ dependencies = [
  "serde",
  "tokio",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]

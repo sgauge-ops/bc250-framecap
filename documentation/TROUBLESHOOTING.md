@@ -51,9 +51,9 @@ Keep the game, driver, and launch settings the same when comparing runs.
    was not loaded, but may also mean the configured log is elsewhere or could
    not be opened. Check stderr and the Vulkan loader diagnostics below.
 
-Framecap searches `framecap.toml` in the process working directory, then
-`$XDG_CONFIG_HOME` if set, then `$HOME/.config`. The first existing file wins:
-an unintended file in the game directory can override the intended settings.
+Framecap creates and prioritizes `$HOME/.config/framecap.toml`; the working
+directory and `$XDG_CONFIG_HOME` are fallback locations. Check that the global
+file is writable if shortcut changes do not persist.
 See [installation](INSTALL.md#configure) for the configuration link and
 [configuration](CONFIGURATION.md) for lookup and validation details.
 

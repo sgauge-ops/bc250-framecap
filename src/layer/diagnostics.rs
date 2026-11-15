@@ -93,10 +93,17 @@ fn write_line(level: &str, message: &str) {
 
 /// Returns the process-wide lazily initialized diagnostic file handle.
 fn file() -> &'static Mutex<Option<File>> {
-    LOG_FILE.get_or_init(|| Mutex::new(open_log_file()))
+    LOG_FILE.get_or_init(|| {
+        #[cfg(test)]
+        let log = None;
+        #[cfg(not(test))]
+        let log = open_log_file();
+        Mutex::new(log)
+    })
 }
 
 /// Opens the configured log using its selected clear-or-append policy.
+#[cfg(not(test))]
 fn open_log_file() -> Option<File> {
     let (settings, _, _) = crate::layer::settings::Settings::load();
     let append_log = settings.diagnostics.append_log;
@@ -139,6 +146,7 @@ fn open_log_file_at(path: &Path, append_log: bool) -> std::io::Result<File> {
 }
 
 /// Resolves the default diagnostic path from the current process environment.
+#[cfg(not(test))]
 fn default_log_path() -> PathBuf {
     default_log_path_from(
         env::var_os("XDG_STATE_HOME"),

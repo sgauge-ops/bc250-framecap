@@ -1,7 +1,7 @@
 use super::config::Config;
 use super::metrics::MetricsAggregator;
 use super::overlay::Overlay;
-use super::renderer::Renderer;
+use super::renderer::ascii::Renderer;
 use super::telemetry::{AmdGpuProvider, GpuTelemetryProvider};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 #[path = "loader.rs"]
 pub mod loader;
 
+/// Validity of a telemetry reading.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TelemetryStatus {
     Available,
@@ -17,6 +18,7 @@ pub enum TelemetryStatus {
     Error,
 }
 
+/// GPU busy-percentage reading with its sample time, status and source device.
 #[derive(Debug, Clone)]
 pub struct GpuMeasurement {
     pub value: f32,
@@ -25,6 +27,7 @@ pub struct GpuMeasurement {
     pub device_id: Option<u32>,
 }
 
+/// Optional CPU, GPU, fan and memory hardware readings; unavailable sensors are `None`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct HardwareMetrics {
     pub cpu_temp_c: Option<f32>,
@@ -42,12 +45,14 @@ pub struct HardwareMetrics {
     pub memory_temp: Option<MemoryTemperature>,
 }
 
+/// VRAM temperature in °C; `lower_bound` marks a saturated reading that may understate the real value.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MemoryTemperature {
     pub celsius: f32,
     pub lower_bound: bool,
 }
 
+/// Frame timing, GPU and hardware metrics captured at one point in time.
 #[derive(Debug, Clone)]
 pub struct MetricsSnapshot {
     frametime_ms: f32,
@@ -190,6 +195,7 @@ impl MetricsSnapshot {
     }
 }
 
+/// Top-level layer state bundling metrics, telemetry, overlay rendering and configuration.
 pub struct FramecapLayer {
     pub metrics_aggregator: MetricsAggregator,
     pub telemetry_provider: Arc<dyn GpuTelemetryProvider>,

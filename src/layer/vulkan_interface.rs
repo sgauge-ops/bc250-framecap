@@ -38,7 +38,7 @@ pub fn init_layer() -> Arc<FramecapLayer> {
         metrics_aggregator: MetricsAggregator::new(config.window_size, provider),
         telemetry_provider: Arc::new(AmdGpuProvider::new(0)), // Ceci est une simplification pour l'exemple
         overlay: crate::layer::overlay::Overlay::new(),
-        renderer: crate::layer::renderer::Renderer::new(),
+        renderer: crate::layer::renderer::ascii::Renderer::new(),
         config,
         poll_count: 0,
     };

@@ -1,7 +1,9 @@
 use crate::layer::auto::{AutoEvaluationSchedule, AutoRegulator};
 use crate::layer::auto_metrics::AutoMetricsHistory;
+use crate::layer::capture::{self, CaptureFrame};
 use crate::layer::config::{Config, Hotkey};
 use crate::layer::diagnostics;
+use crate::layer::gpu_capture::{CalibrationWorker, Markers, Preparation, Submission};
 use crate::layer::input_x11::HotkeyWorker;
 use crate::layer::lib::{GpuMeasurement, HardwareMetrics, MemoryTemperature, TelemetryStatus};
 use crate::layer::limiter::{wait_until, FrameCapController, FrameScheduler};
@@ -15,10 +17,11 @@ use crate::layer::telemetry::{
 };
 use ash::vk::{self, Handle};
 use parking_lot::{Condvar, Mutex};
-use std::collections::{HashMap, VecDeque};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, c_void, CStr};
 use std::mem;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -26,9 +29,11 @@ use std::time::{Duration, Instant};
 const LOADER_INSTANCE_CREATE_INFO: i32 = 47;
 const LOADER_DEVICE_CREATE_INFO: i32 = 48;
 const LAYER_LINK_INFO: i32 = 0;
+/// Optional `vk_layerGetPhysicalDeviceProcAddr` function pointer from the loader interface.
 type PfnGetPhysicalDeviceProcAddr =
     Option<unsafe extern "system" fn(vk::Instance, *const c_char) -> vk::PFN_vkVoidFunction>;
 
+/// Loader-provided linked-list node holding the next layer's instance entry points.
 #[repr(C)]
 struct LayerInstanceLink {
     next: *mut LayerInstanceLink,
@@ -36,12 +41,14 @@ struct LayerInstanceLink {
     next_get_physical_device_proc_addr: PfnGetPhysicalDeviceProcAddr,
 }
 
+/// Payload of the instance layer create-info: either the link chain or loader data callback.
 #[repr(C)]
 union InstanceLayerInfoUnion {
     layer_info: *mut LayerInstanceLink,
     set_loader_data: *const c_void,
 }
 
+/// Loader-defined `VkLayerInstanceCreateInfo` chained into `VkInstanceCreateInfo::pNext`.
 #[repr(C)]
 struct LayerInstanceCreateInfo {
     s_type: i32,
@@ -50,6 +57,7 @@ struct LayerInstanceCreateInfo {
     u: InstanceLayerInfoUnion,
 }
 
+/// Loader-provided linked-list node holding the next layer's instance and device entry points.
 #[repr(C)]
 struct LayerDeviceLink {
     next: *mut LayerDeviceLink,
@@ -57,12 +65,14 @@ struct LayerDeviceLink {
     next_get_device_proc_addr: vk::PFN_vkGetDeviceProcAddr,
 }
 
+/// Payload of the device layer create-info: either the link chain or loader data callback.
 #[repr(C)]
 union DeviceLayerInfoUnion {
     layer_info: *mut LayerDeviceLink,
     set_loader_data: *const c_void,
 }
 
+/// Loader-defined `VkLayerDeviceCreateInfo` chained into `VkDeviceCreateInfo::pNext`.
 #[repr(C)]
 struct LayerDeviceCreateInfo {
     s_type: i32,
@@ -71,6 +81,7 @@ struct LayerDeviceCreateInfo {
     u: DeviceLayerInfoUnion,
 }
 
+/// Loader/layer interface negotiation structure (`VkNegotiateLayerInterface`).
 #[repr(C)]
 pub struct NegotiateLayerInterface {
     s_type: i32,
@@ -81,15 +92,53 @@ pub struct NegotiateLayerInterface {
     get_physical_device_proc_addr: PfnGetPhysicalDeviceProcAddr,
 }
 
+/// Per-instance dispatch data: next `vkGetInstanceProcAddr` and calibrated-timestamp support flags.
 #[derive(Clone, Copy)]
 struct InstanceDispatch {
     handle: vk::Instance,
     next_gipa: vk::PFN_vkGetInstanceProcAddr,
+    calibration_core: bool,
+    calibration_properties2: bool,
 }
 
+/// Downstream submit and wait entry points that the layer intercepts for tracing.
+#[derive(Clone, Copy)]
+struct TraceDispatch {
+    queue_submit: Option<vk::PFN_vkQueueSubmit>,
+    queue_submit2: Option<vk::PFN_vkQueueSubmit2>,
+    queue_submit2_khr: Option<vk::PFN_vkQueueSubmit2>,
+    wait_fences: Option<vk::PFN_vkWaitForFences>,
+    wait_semaphores: Option<vk::PFN_vkWaitSemaphores>,
+    wait_semaphores_khr: Option<vk::PFN_vkWaitSemaphores>,
+    queue_wait_idle: Option<vk::PFN_vkQueueWaitIdle>,
+    device_wait_idle: Option<vk::PFN_vkDeviceWaitIdle>,
+}
+
+impl TraceDispatch {
+    /// Resolves the downstream trace entry points for a device; missing ones stay `None`.
+    unsafe fn load(device: vk::Device, next: vk::PFN_vkGetDeviceProcAddr) -> Self {
+        Self {
+            queue_submit: next(device, c"vkQueueSubmit".as_ptr()).map(|p| mem::transmute(p)),
+            queue_submit2: next(device, c"vkQueueSubmit2".as_ptr()).map(|p| mem::transmute(p)),
+            queue_submit2_khr: next(device, c"vkQueueSubmit2KHR".as_ptr())
+                .map(|p| mem::transmute(p)),
+            wait_fences: next(device, c"vkWaitForFences".as_ptr()).map(|p| mem::transmute(p)),
+            wait_semaphores: next(device, c"vkWaitSemaphores".as_ptr()).map(|p| mem::transmute(p)),
+            wait_semaphores_khr: next(device, c"vkWaitSemaphoresKHR".as_ptr())
+                .map(|p| mem::transmute(p)),
+            queue_wait_idle: next(device, c"vkQueueWaitIdle".as_ptr()).map(|p| mem::transmute(p)),
+            device_wait_idle: next(device, c"vkDeviceWaitIdle".as_ptr()).map(|p| mem::transmute(p)),
+        }
+    }
+}
+
+/// Per-device layer state: downstream dispatch, telemetry, overlay, pacing, auto regulation and swapchains.
 struct DeviceState {
     next_gdpa: vk::PFN_vkGetDeviceProcAddr,
     next_present: Option<vk::PFN_vkQueuePresentKHR>,
+    next_acquire: Option<vk::PFN_vkAcquireNextImageKHR>,
+    next_acquire2: Option<vk::PFN_vkAcquireNextImage2KHR>,
+    trace_dispatch: TraceDispatch,
     ash_device: ash::Device,
     telemetry: TelemetryWorker,
     telemetry_expiry: Duration,
@@ -101,6 +150,11 @@ struct DeviceState {
     overlay_renderer: Arc<OverlayRendererState>,
     overlay_fps_color: [u8; 3],
     queue_families: HashMap<usize, u32>,
+    protected_queues: HashSet<usize>,
+    multi_device: bool,
+    gpu_markers: Markers,
+    gpu_overlay_markers: Markers,
+    gpu_calibration: Option<CalibrationWorker>,
     frame_cap: Arc<FrameCapController>,
     overlay_mode: Arc<OverlayModeState>,
     active_auto_algorithm: Arc<AtomicI32>,
@@ -113,10 +167,12 @@ struct DeviceState {
     auto_metrics: HashMap<u64, Vec<AutoMetricsHistory>>,
     auto_evaluation_swapchain: Option<u64>,
     schedulers: HashMap<usize, FrameScheduler>,
+    present_modes: HashMap<u64, vk::PresentModeKHR>,
     hotkeys: Option<HotkeyWorker>,
     swapchains: HashMap<u64, VulkanSwapchainRenderer>,
 }
 
+/// Background GPU/hardware telemetry poller sharing its latest sample with presenting threads.
 struct TelemetryWorker {
     latest: Arc<parking_lot::RwLock<TelemetrySample>>,
     stop: Arc<AtomicBool>,
@@ -124,6 +180,7 @@ struct TelemetryWorker {
     memory: Option<MemoryTemperatureWorker>,
 }
 
+/// Background poller of the GDDR6 hotspot temperature; stops permanently after a read error.
 struct MemoryTemperatureWorker {
     latest: Arc<parking_lot::RwLock<Option<(MemoryTemperature, Instant)>>>,
     stop: Arc<(Mutex<bool>, Condvar)>,
@@ -132,6 +189,7 @@ struct MemoryTemperatureWorker {
     stale_reported: AtomicBool,
 }
 
+/// Adds a sample and returns the mean over the window; the result is a lower bound if any sample was.
 fn smooth_memory_temperature(
     samples: &mut VecDeque<(Instant, MemoryTemperature)>,
     timestamp: Instant,
@@ -152,12 +210,14 @@ fn smooth_memory_temperature(
 }
 
 impl MemoryTemperatureWorker {
+    /// Starts polling the real hwmon hotspot sensor.
     fn start(interval: Duration, smoothing_window: Duration) -> Self {
         Self::start_with_reader(interval, smoothing_window, || {
             crate::layer::memory_temperature::read_hotspot()
         })
     }
 
+    /// Starts the polling thread with a custom reader, smoothing readings over the given window.
     fn start_with_reader(
         interval: Duration,
         smoothing_window: Duration,
@@ -218,6 +278,7 @@ impl MemoryTemperatureWorker {
         }
     }
 
+    /// Returns the latest smoothed temperature, or `None` if unavailable or older than two intervals.
     fn current(&self) -> Option<MemoryTemperature> {
         let latest = *self.latest.read();
         match latest {
@@ -235,6 +296,7 @@ impl MemoryTemperatureWorker {
         }
     }
 
+    /// Signals the polling thread to exit and joins it.
     fn stop(&mut self) {
         let (lock, wake) = &*self.stop;
         *lock.lock() = true;
@@ -247,6 +309,7 @@ impl MemoryTemperatureWorker {
     }
 }
 
+/// Latest telemetry: smoothed values for display and raw values for auto regulation.
 #[derive(Clone)]
 struct TelemetrySample {
     gpu: GpuMeasurement,
@@ -397,6 +460,58 @@ fn device_for_queue(queue: vk::Queue) -> Option<Arc<Mutex<DeviceState>>> {
     })
 }
 
+static TRACE_DISPATCH_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// Thread-local cache of trace dispatch tables, invalidated when the global epoch changes.
+#[derive(Default)]
+struct TraceDispatchCache {
+    epoch: u64,
+    devices: HashMap<usize, TraceDispatch>,
+    queues: HashMap<usize, TraceDispatch>,
+}
+
+thread_local! {
+    static TRACE_DISPATCH_CACHE: RefCell<TraceDispatchCache> = RefCell::new(TraceDispatchCache::default());
+}
+
+/// Looks up the trace dispatch under the global locks, keyed by device or by queue.
+fn lookup_trace_dispatch(key: usize, queue: bool) -> Option<TraceDispatch> {
+    if queue {
+        device_for_queue(vk::Queue::from_raw(key as u64)).map(|state| state.lock().trace_dispatch)
+    } else {
+        devices()
+            .lock()
+            .get(&key)
+            .map(|state| state.lock().trace_dispatch)
+    }
+}
+
+/// Returns the trace dispatch from the thread-local cache, falling back to a locked lookup on a miss.
+fn cached_trace_dispatch(key: usize, queue: bool) -> Option<TraceDispatch> {
+    TRACE_DISPATCH_CACHE
+        .try_with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let epoch = TRACE_DISPATCH_EPOCH.load(Ordering::Acquire);
+            if cache.epoch != epoch {
+                cache.epoch = epoch;
+                cache.devices.clear();
+                cache.queues.clear();
+            }
+            let entries = if queue {
+                &mut cache.queues
+            } else {
+                &mut cache.devices
+            };
+            if let Some(dispatch) = entries.get(&key) {
+                return Some(*dispatch);
+            }
+            let dispatch = lookup_trace_dispatch(key, queue)?;
+            entries.insert(key, dispatch);
+            Some(dispatch)
+        })
+        .unwrap_or_else(|_| lookup_trace_dispatch(key, queue))
+}
+
 /// Returns the dispatch-table key for a Vulkan handle.
 unsafe fn dispatch_key<T: Handle>(handle: T) -> usize {
     key(handle)
@@ -407,9 +522,108 @@ unsafe fn proc_name(name: *const c_char) -> Option<&'static CStr> {
     (!name.is_null()).then(|| CStr::from_ptr(name))
 }
 
+/// Returns whether a C array of extension names contains the given extension.
+unsafe fn has_extension(count: u32, names: *const *const c_char, extension: &CStr) -> bool {
+    if count == 0 || names.is_null() {
+        return false;
+    }
+    std::slice::from_raw_parts(names, count as usize)
+        .iter()
+        .any(|name| !name.is_null() && CStr::from_ptr(*name) == extension)
+}
+
+/// Checks that the device exposes the calibrated-timestamps extension with device and monotonic-clock domains.
+unsafe fn calibration_supported(
+    instance: InstanceDispatch,
+    physical_device: vk::PhysicalDevice,
+    extension: &CStr,
+    domain_command: &CStr,
+) -> bool {
+    let Some(enumerate) = (instance.next_gipa)(
+        instance.handle,
+        c"vkEnumerateDeviceExtensionProperties".as_ptr(),
+    ) else {
+        diagnostics::warn("GPU calibration: device extension enumeration unavailable");
+        return false;
+    };
+    let enumerate: vk::PFN_vkEnumerateDeviceExtensionProperties = mem::transmute(enumerate);
+    let mut count = 0;
+    let result = enumerate(
+        physical_device,
+        std::ptr::null(),
+        &mut count,
+        std::ptr::null_mut(),
+    );
+    if result != vk::Result::SUCCESS {
+        diagnostics::warn(format!(
+            "GPU calibration: extension enumeration failed: {result:?}"
+        ));
+        return false;
+    }
+    let mut properties = vec![vk::ExtensionProperties::default(); count as usize];
+    let result = enumerate(
+        physical_device,
+        std::ptr::null(),
+        &mut count,
+        properties.as_mut_ptr(),
+    );
+    if result != vk::Result::SUCCESS {
+        diagnostics::warn(format!(
+            "GPU calibration: extension enumeration failed: {result:?}"
+        ));
+        return false;
+    }
+    properties.truncate(count as usize);
+    if !properties
+        .iter()
+        .any(|property| CStr::from_ptr(property.extension_name.as_ptr()) == extension)
+    {
+        return false;
+    }
+    let Some(domains) = (instance.next_gipa)(instance.handle, domain_command.as_ptr()) else {
+        diagnostics::warn("GPU calibration: time-domain query unavailable");
+        return false;
+    };
+    let domains: vk::PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR = mem::transmute(domains);
+    let mut count = 0;
+    let result = domains(physical_device, &mut count, std::ptr::null_mut());
+    if result != vk::Result::SUCCESS || count == 0 {
+        diagnostics::warn(format!(
+            "GPU calibration: time-domain query failed: {result:?}"
+        ));
+        return false;
+    }
+    let mut values = vec![vk::TimeDomainKHR::default(); count as usize];
+    let result = domains(physical_device, &mut count, values.as_mut_ptr());
+    if result != vk::Result::SUCCESS {
+        diagnostics::warn(format!(
+            "GPU calibration: time-domain query failed: {result:?}"
+        ));
+        return false;
+    }
+    values.truncate(count as usize);
+    values.contains(&vk::TimeDomainKHR::DEVICE)
+        && values.contains(&vk::TimeDomainKHR::CLOCK_MONOTONIC)
+}
+
 /// Wraps a layer function pointer in Vulkan's optional function-pointer type.
 unsafe fn proc<T: Copy>(function: T) -> vk::PFN_vkVoidFunction {
     Some(mem::transmute_copy(&function))
+}
+
+/// Returns the layer's tracing hook for a submit/wait entry point name, if intercepted.
+unsafe fn trace_proc(name: &CStr) -> vk::PFN_vkVoidFunction {
+    match name.to_bytes() {
+        b"vkQueueSubmit" => proc(vkQueueSubmit as vk::PFN_vkQueueSubmit),
+        b"vkQueueSubmit2" => proc(vkQueueSubmit2 as vk::PFN_vkQueueSubmit2),
+        b"vkQueueSubmit2KHR" => proc(vkQueueSubmit2KHR as vk::PFN_vkQueueSubmit2),
+        b"vkWaitForFences" => proc(vkWaitForFences as vk::PFN_vkWaitForFences),
+        b"vkWaitSemaphores" => proc(vkWaitSemaphores as vk::PFN_vkWaitSemaphores),
+        b"vkWaitSemaphoresKHR" => proc(vkWaitSemaphoresKHR as vk::PFN_vkWaitSemaphores),
+        b"vkQueueWaitIdle" => proc(vkQueueWaitIdle as vk::PFN_vkQueueWaitIdle),
+        b"vkDeviceWaitIdle" => proc(vkDeviceWaitIdle as vk::PFN_vkDeviceWaitIdle),
+        _ => None,
+    }
 }
 
 /// Resolves the next layer's instance proc-address function.
@@ -540,6 +754,24 @@ pub unsafe extern "system" fn vkGetInstanceProcAddr(
     let Some(name) = proc_name(name) else {
         return None;
     };
+    if let Some(interceptor) = trace_proc(name) {
+        return next_instance_gipa(instance)
+            .and_then(|next| next(instance, name.as_ptr()))
+            .map(|_| interceptor);
+    }
+    let device_interceptor = match name.to_bytes() {
+        b"vkGetDeviceQueue" => proc(vkGetDeviceQueue as vk::PFN_vkGetDeviceQueue),
+        b"vkGetDeviceQueue2" => proc(vkGetDeviceQueue2 as vk::PFN_vkGetDeviceQueue2),
+        b"vkQueuePresentKHR" => proc(vkQueuePresentKHR as vk::PFN_vkQueuePresentKHR),
+        b"vkAcquireNextImageKHR" => proc(vkAcquireNextImageKHR as vk::PFN_vkAcquireNextImageKHR),
+        b"vkAcquireNextImage2KHR" => proc(vkAcquireNextImage2KHR as vk::PFN_vkAcquireNextImage2KHR),
+        _ => None,
+    };
+    if let Some(interceptor) = device_interceptor {
+        return next_instance_gipa(instance)
+            .and_then(|next| next(instance, name.as_ptr()))
+            .map(|_| interceptor);
+    }
     match name.to_bytes() {
         b"vkGetInstanceProcAddr" => proc(vkGetInstanceProcAddr as vk::PFN_vkGetInstanceProcAddr),
         b"vkGetDeviceProcAddr" => proc(vkGetDeviceProcAddr as vk::PFN_vkGetDeviceProcAddr),
@@ -667,10 +899,27 @@ pub unsafe extern "system" fn vkGetDeviceProcAddr(
     let Some(name) = proc_name(name) else {
         return None;
     };
+    if let Some(interceptor) = trace_proc(name) {
+        return devices()
+            .lock()
+            .get(&dispatch_key(device))
+            .and_then(|state| (state.lock().next_gdpa)(device, name.as_ptr()))
+            .map(|_| interceptor);
+    }
     match name.to_bytes() {
         b"vkGetDeviceProcAddr" => proc(vkGetDeviceProcAddr as vk::PFN_vkGetDeviceProcAddr),
         b"vkDestroyDevice" => proc(vkDestroyDevice as vk::PFN_vkDestroyDevice),
         b"vkQueuePresentKHR" => proc(vkQueuePresentKHR as vk::PFN_vkQueuePresentKHR),
+        b"vkAcquireNextImageKHR" => devices()
+            .lock()
+            .get(&dispatch_key(device))
+            .and_then(|state| state.lock().next_acquire)
+            .and_then(|_| proc(vkAcquireNextImageKHR as vk::PFN_vkAcquireNextImageKHR)),
+        b"vkAcquireNextImage2KHR" => devices()
+            .lock()
+            .get(&dispatch_key(device))
+            .and_then(|state| state.lock().next_acquire2)
+            .and_then(|_| proc(vkAcquireNextImage2KHR as vk::PFN_vkAcquireNextImage2KHR)),
         b"vkCreateSwapchainKHR" => proc(vkCreateSwapchainKHR as vk::PFN_vkCreateSwapchainKHR),
         b"vkDestroySwapchainKHR" => proc(vkDestroySwapchainKHR as vk::PFN_vkDestroySwapchainKHR),
         b"vkGetDeviceQueue" => proc(vkGetDeviceQueue as vk::PFN_vkGetDeviceQueue),
@@ -767,11 +1016,25 @@ pub unsafe extern "system" fn vkCreateInstance(
         ));
     }
     if result == vk::Result::SUCCESS {
+        let api_version = if application.is_null() || (*application).api_version == 0 {
+            vk::API_VERSION_1_0
+        } else {
+            (*application).api_version
+        };
+        let calibration_core = vk::api_version_major(api_version) > 1
+            || (vk::api_version_major(api_version) == 1 && vk::api_version_minor(api_version) >= 1);
+        let calibration_properties2 = has_extension(
+            (*create_info).enabled_extension_count,
+            (*create_info).pp_enabled_extension_names,
+            vk::KHR_GET_PHYSICAL_DEVICE_PROPERTIES2_NAME,
+        );
         instances().lock().insert(
             key(*instance),
             InstanceDispatch {
                 handle: *instance,
                 next_gipa,
+                calibration_core,
+                calibration_properties2,
             },
         );
         diagnostics::info(format!(
@@ -812,6 +1075,16 @@ pub unsafe extern "system" fn vkCreateDevice(
         diagnostics::error("vkCreateDevice received a null create_info or device pointer");
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
+    let mut device_chain = (*create_info).p_next;
+    let mut multi_device = false;
+    while !device_chain.is_null() {
+        let header = &*device_chain.cast::<vk::BaseInStructure<'_>>();
+        if header.s_type == vk::StructureType::DEVICE_GROUP_DEVICE_CREATE_INFO {
+            let group = &*device_chain.cast::<vk::DeviceGroupDeviceCreateInfo<'_>>();
+            multi_device = group.physical_device_count > 1;
+        }
+        device_chain = header.p_next.cast();
+    }
     let mut chain = (*create_info).p_next;
     let mut next_gdpa = None;
     while !chain.is_null() {
@@ -846,8 +1119,73 @@ pub unsafe extern "system" fn vkCreateDevice(
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
     let create_device: vk::PFN_vkCreateDevice = mem::transmute(create_device);
+    let mut physical_properties = vk::PhysicalDeviceProperties::default();
+    if let Some(get_properties) = (instance_dispatch.next_gipa)(
+        instance_dispatch.handle,
+        c"vkGetPhysicalDeviceProperties".as_ptr(),
+    ) {
+        let get_properties: vk::PFN_vkGetPhysicalDeviceProperties = mem::transmute(get_properties);
+        get_properties(physical_device, &mut physical_properties);
+    }
+    let physical_api_version = physical_properties.api_version;
+    let physical_core = vk::api_version_major(physical_api_version) > 1
+        || (vk::api_version_major(physical_api_version) == 1
+            && vk::api_version_minor(physical_api_version) >= 1);
+    let names = (*create_info).pp_enabled_extension_names;
+    let count = (*create_info).enabled_extension_count;
+    let khr_enabled = has_extension(count, names, vk::KHR_CALIBRATED_TIMESTAMPS_NAME);
+    let ext_enabled = has_extension(count, names, vk::EXT_CALIBRATED_TIMESTAMPS_NAME);
+    let khr = (
+        vk::KHR_CALIBRATED_TIMESTAMPS_NAME,
+        c"vkGetPhysicalDeviceCalibrateableTimeDomainsKHR",
+        c"vkGetCalibratedTimestampsKHR",
+    );
+    let ext = (
+        vk::EXT_CALIBRATED_TIMESTAMPS_NAME,
+        c"vkGetPhysicalDeviceCalibrateableTimeDomainsEXT",
+        c"vkGetCalibratedTimestampsEXT",
+    );
+    let both = [ext, khr];
+    let candidates: &[_] = if khr_enabled {
+        std::slice::from_ref(&khr)
+    } else if ext_enabled {
+        std::slice::from_ref(&ext)
+    } else {
+        &both
+    };
+    let calibration = if !multi_device
+        && (instance_dispatch.calibration_properties2
+            || (instance_dispatch.calibration_core && physical_core))
+        && (count == 0 || !names.is_null())
+    {
+        candidates.iter().copied().find(|(name, domains, _)| {
+            calibration_supported(instance_dispatch, physical_device, name, domains)
+        })
+    } else {
+        None
+    };
+    let mut extension_names = Vec::new();
+    let mut augmented_info = *create_info;
+    let add_calibration = calibration.is_some() && !khr_enabled && !ext_enabled;
+    if let Some((calibration_name, _, _)) = calibration.filter(|_| add_calibration) {
+        if count > 0 {
+            extension_names.extend_from_slice(std::slice::from_raw_parts(names, count as usize));
+        }
+        extension_names.push(calibration_name.as_ptr());
+        augmented_info.enabled_extension_count = extension_names.len() as u32;
+        augmented_info.pp_enabled_extension_names = extension_names.as_ptr();
+    }
     let start = Instant::now();
-    let result = create_device(physical_device, create_info, allocator, device);
+    let result = create_device(
+        physical_device,
+        if add_calibration {
+            &augmented_info
+        } else {
+            create_info
+        },
+        allocator,
+        device,
+    );
     let elapsed = start.elapsed();
     if result != vk::Result::SUCCESS {
         diagnostics::error(format!(
@@ -856,14 +1194,18 @@ pub unsafe extern "system" fn vkCreateDevice(
         ));
     }
     if result == vk::Result::SUCCESS {
-        let mut physical_properties = vk::PhysicalDeviceProperties::default();
-        if let Some(get_properties) = (instance_dispatch.next_gipa)(
+        let mut queue_properties = Vec::new();
+        if let Some(get_queues) = (instance_dispatch.next_gipa)(
             instance_dispatch.handle,
-            c"vkGetPhysicalDeviceProperties".as_ptr(),
+            c"vkGetPhysicalDeviceQueueFamilyProperties".as_ptr(),
         ) {
-            let get_properties: vk::PFN_vkGetPhysicalDeviceProperties =
-                mem::transmute(get_properties);
-            get_properties(physical_device, &mut physical_properties);
+            let get_queues: vk::PFN_vkGetPhysicalDeviceQueueFamilyProperties =
+                mem::transmute(get_queues);
+            let mut count = 0;
+            get_queues(physical_device, &mut count, std::ptr::null_mut());
+            queue_properties.resize(count as usize, vk::QueueFamilyProperties::default());
+            get_queues(physical_device, &mut count, queue_properties.as_mut_ptr());
+            queue_properties.truncate(count as usize);
         }
         let config = Config::load();
         let device_name = CStr::from_ptr(physical_properties.device_name.as_ptr())
@@ -897,8 +1239,9 @@ pub unsafe extern "system" fn vkCreateDevice(
             .collect::<Vec<_>>()
             .join(",");
         diagnostics::info(format!(
-            "configuration: startup_fps={} input_enabled={} hotkeys=auto:{:?},down:{:?},up:{:?},toggle:{:?} overlay_startup={} overlay_renderer={:?} auto_algorithms=[{}] gpu_increase_limit={} gpu_decrease_limit={} frame_jitter_limit_ms={} manual_step_fps={} manual_bounds={}..{} gpu_poll_rate_ms={} memory_poll_rate_ms={} overlay_refresh_rate={} gpu_expiry_ms={} gpu_smoothing_window_ms={} background_opacity={} fps_color={:?} window_size={}",
+            "configuration: startup_fps={} startup_mode={:?} input_enabled={} hotkeys=auto:{:?},down:{:?},up:{:?},toggle:{:?} overlay_startup={} overlay_renderer={:?} auto_algorithms=[{}] gpu_increase_limit={} gpu_decrease_limit={} frame_jitter_limit_ms={} manual_step_fps={} manual_bounds={}..{} gpu_poll_rate_ms={} memory_poll_rate_ms={} overlay_refresh_rate={} gpu_expiry_ms={} gpu_smoothing_window_ms={} background_opacity={} fps_color={:?} window_size={}",
             config.target_fps.map_or_else(|| "OFF".to_owned(), |fps| fps.to_string()),
+            config.startup_mode,
             config.input_enabled,
             config.hotkey_auto,
             config.hotkey_down,
@@ -927,12 +1270,15 @@ pub unsafe extern "system" fn vkCreateDevice(
             config.manual_min_fps,
             config.manual_max_fps,
         ));
+        if matches!(config.startup_mode, crate::layer::config::StartupMode::Off) {
+            frame_cap.set_target_fps(None);
+        }
         let overlay_mode = Arc::new(OverlayModeState::new(config.startup));
         let overlay_renderer = Arc::new(OverlayRendererState::new(config.overlay_renderer));
-        let active_auto_algorithm = Arc::new(AtomicI32::new(if config.target_fps.is_some() {
-            0
-        } else {
-            -1
+        let active_auto_algorithm = Arc::new(AtomicI32::new(match config.startup_mode {
+            crate::layer::config::StartupMode::Off => -1,
+            crate::layer::config::StartupMode::Manual => 0,
+            crate::layer::config::StartupMode::Automatic(index) => index as i32 + 1,
         }));
         let overlay_feedback = Arc::new(OverlayFeedbackState::new());
         let auto_hysteresis = Arc::new(
@@ -970,11 +1316,46 @@ pub unsafe extern "system" fn vkCreateDevice(
                 .iter()
                 .map(|algorithm| algorithm.metric)
                 .collect(),
+            config
+                .auto_algorithms
+                .iter()
+                .map(|algorithm| algorithm.name.clone())
+                .collect(),
             config.manual_step_fps,
+            config
+                .target_fps
+                .unwrap_or(crate::layer::config::DEFAULT_TARGET_FPS),
             Arc::clone(&overlay_feedback),
         );
         let next_present = next_gdpa(*device, c"vkQueuePresentKHR".as_ptr())
             .map(|function| mem::transmute(function));
+        let next_acquire = next_gdpa(*device, c"vkAcquireNextImageKHR".as_ptr())
+            .map(|function| mem::transmute(function));
+        let next_acquire2 = next_gdpa(*device, c"vkAcquireNextImage2KHR".as_ptr())
+            .map(|function| mem::transmute(function));
+        let gpu_calibration = if let Some((_, _, timestamp_command)) = calibration {
+            match next_gdpa(*device, timestamp_command.as_ptr()) {
+                Some(function) => {
+                    let function: vk::PFN_vkGetCalibratedTimestampsKHR = mem::transmute(function);
+                    match CalibrationWorker::start(*device, function) {
+                        Ok(worker) => Some(worker),
+                        Err(error) => {
+                            diagnostics::error(format!(
+                                "GPU calibration worker failed to start: {error}"
+                            ));
+                            None
+                        }
+                    }
+                }
+                None => {
+                    diagnostics::warn("GPU calibration: timestamp command unavailable");
+                    None
+                }
+            }
+        } else {
+            diagnostics::warn("GPU calibration unavailable: extension or time domains unsupported");
+            None
+        };
         let ash_device = ash::Device::load_with(
             |name: &CStr| {
                 next_gdpa(*device, name.as_ptr())
@@ -998,6 +1379,9 @@ pub unsafe extern "system" fn vkCreateDevice(
             Arc::new(Mutex::new(DeviceState {
                 next_gdpa,
                 next_present,
+                next_acquire,
+                next_acquire2,
+                trace_dispatch: TraceDispatch::load(*device, next_gdpa),
                 ash_device,
                 telemetry: TelemetryWorker::start(
                     gpu_provider,
@@ -1022,6 +1406,17 @@ pub unsafe extern "system" fn vkCreateDevice(
                 auto_metrics: HashMap::new(),
                 auto_evaluation_swapchain: None,
                 queue_families: HashMap::new(),
+                protected_queues: HashSet::new(),
+                multi_device,
+                gpu_markers: Markers::new(
+                    queue_properties.clone(),
+                    physical_properties.limits.timestamp_period,
+                ),
+                gpu_overlay_markers: Markers::new_overlay(
+                    queue_properties,
+                    physical_properties.limits.timestamp_period,
+                ),
+                gpu_calibration,
                 frame_cap,
                 overlay_mode,
                 active_auto_algorithm,
@@ -1035,10 +1430,106 @@ pub unsafe extern "system" fn vkCreateDevice(
                 manual_step_fps: config.manual_step_fps,
                 overlay_feedback,
                 schedulers: HashMap::new(),
+                present_modes: HashMap::new(),
                 hotkeys,
                 swapchains: HashMap::new(),
             })),
         );
+        TRACE_DISPATCH_EPOCH.fetch_add(1, Ordering::Release);
+    }
+    result
+}
+
+#[no_mangle]
+/// Forwards `vkAcquireNextImageKHR`, recording capture and trace data when active.
+pub unsafe extern "system" fn vkAcquireNextImageKHR(
+    device: vk::Device,
+    swapchain: vk::SwapchainKHR,
+    timeout: u64,
+    semaphore: vk::Semaphore,
+    fence: vk::Fence,
+    image_index: *mut u32,
+) -> vk::Result {
+    let acquire = devices()
+        .lock()
+        .get(&dispatch_key(device))
+        .and_then(|state| state.lock().next_acquire);
+    let Some(acquire) = acquire else {
+        diagnostics::error("vkAcquireNextImageKHR: downstream function was not found");
+        return vk::Result::ERROR_EXTENSION_NOT_PRESENT;
+    };
+    let trace = capture::trace(
+        "acquire",
+        device.as_raw(),
+        swapchain.as_raw(),
+        1,
+        Some(timeout),
+    );
+    let capture = capture::acquire();
+    let result = acquire(device, swapchain, timeout, semaphore, fence, image_index);
+    if let Some(capture) = capture {
+        let image = if matches!(result, vk::Result::SUCCESS | vk::Result::SUBOPTIMAL_KHR)
+            && !image_index.is_null()
+        {
+            Some(*image_index)
+        } else {
+            None
+        };
+        capture.finish(device.as_raw(), swapchain.as_raw(), image, result.as_raw());
+    }
+    if let Some(trace) = trace {
+        trace.finish(result.as_raw());
+    }
+    result
+}
+
+#[no_mangle]
+/// Forwards `vkAcquireNextImage2KHR`, recording capture and trace data when active.
+pub unsafe extern "system" fn vkAcquireNextImage2KHR(
+    device: vk::Device,
+    info: *const vk::AcquireNextImageInfoKHR<'_>,
+    image_index: *mut u32,
+) -> vk::Result {
+    let acquire = devices()
+        .lock()
+        .get(&dispatch_key(device))
+        .and_then(|state| state.lock().next_acquire2);
+    let Some(acquire) = acquire else {
+        diagnostics::error("vkAcquireNextImage2KHR: downstream function was not found");
+        return vk::Result::ERROR_EXTENSION_NOT_PRESENT;
+    };
+    let (trace_swapchain, trace_timeout) = if capture::is_active() && !info.is_null() {
+        ((*info).swapchain.as_raw(), Some((*info).timeout))
+    } else {
+        (0, None)
+    };
+    let trace = capture::trace(
+        "acquire2",
+        device.as_raw(),
+        trace_swapchain,
+        1,
+        trace_timeout,
+    );
+    let capture = capture::acquire();
+    let result = acquire(device, info, image_index);
+    if let Some(capture) = capture {
+        let image = if matches!(result, vk::Result::SUCCESS | vk::Result::SUBOPTIMAL_KHR)
+            && !info.is_null()
+            && !image_index.is_null()
+        {
+            Some(*image_index)
+        } else {
+            None
+        };
+        let swapchain = if info.is_null() {
+            0
+        } else {
+            (*info).swapchain.as_raw()
+        };
+        capture.finish(device.as_raw(), swapchain, image, result.as_raw());
+    }
+    if let Some(trace) = trace {
+        trace.finish(result.as_raw());
     }
     result
 }
@@ -1093,6 +1584,12 @@ pub unsafe extern "system" fn vkCreateSwapchainKHR(
     let start = Instant::now();
     let result = create_swapchain(device, create_info, allocator, swapchain);
     let elapsed = start.elapsed();
+    if result == vk::Result::SUCCESS {
+        state
+            .lock()
+            .present_modes
+            .insert((*swapchain).as_raw(), (*create_info).present_mode);
+    }
     if result != vk::Result::SUCCESS {
         diagnostics::error(format!(
             "downstream vkCreateSwapchainKHR failed: result={result:?} extent={}x{} format={:?} image_usage={:?} elapsed_ms={:.3}",
@@ -1191,9 +1688,13 @@ pub unsafe extern "system" fn vkDestroySwapchainKHR(
     allocator: *const vk::AllocationCallbacks<'_>,
 ) {
     if let Some(state) = devices().lock().get(&dispatch_key(device)).cloned() {
+        capture::retire_swapchain(device.as_raw(), swapchain.as_raw());
         let (next_gdpa, ash_device, mut renderer) = {
             let mut state = state.lock();
             state.auto_metrics.remove(&swapchain.as_raw());
+            state.present_modes.remove(&swapchain.as_raw());
+            state.gpu_markers.retire(swapchain.as_raw());
+            state.gpu_overlay_markers.retire(swapchain.as_raw());
             if state.auto_evaluation_swapchain == Some(swapchain.as_raw()) {
                 state.auto_evaluation_swapchain = None;
             }
@@ -1238,6 +1739,7 @@ pub unsafe extern "system" fn vkGetDeviceQueue(
                 .lock()
                 .queue_families
                 .insert(dispatch_key(*queue), queue_family_index);
+            TRACE_DISPATCH_EPOCH.fetch_add(1, Ordering::Release);
         }
     }
 }
@@ -1261,12 +1763,166 @@ pub unsafe extern "system" fn vkGetDeviceQueue2(
     if let Some(get_queue) = get_queue {
         get_queue(device, queue_info, queue);
         if !(*queue).is_null() {
+            let mut state = state.lock();
+            let key = dispatch_key(*queue);
             state
-                .lock()
                 .queue_families
-                .insert(dispatch_key(*queue), (*queue_info).queue_family_index);
+                .insert(key, (*queue_info).queue_family_index);
+            if (*queue_info)
+                .flags
+                .contains(vk::DeviceQueueCreateFlags::PROTECTED)
+            {
+                state.protected_queues.insert(key);
+            }
+            TRACE_DISPATCH_EPOCH.fetch_add(1, Ordering::Release);
         }
     }
+}
+
+macro_rules! trace_downstream {
+    ($dispatch:expr, $field:ident, $name:expr, $trace:expr) => {
+        match $dispatch.and_then(|dispatch| dispatch.$field) {
+            Some(function) => function,
+            None => {
+                diagnostics::error(format!("{}: downstream function was not found", $name));
+                let result = vk::Result::ERROR_INITIALIZATION_FAILED;
+                if let Some(trace) = $trace {
+                    trace.finish(result.as_raw());
+                }
+                return result;
+            }
+        }
+    };
+}
+
+#[no_mangle]
+/// Traces and forwards `vkQueueSubmit`.
+pub unsafe extern "system" fn vkQueueSubmit(
+    queue: vk::Queue,
+    count: u32,
+    submits: *const vk::SubmitInfo<'_>,
+    fence: vk::Fence,
+) -> vk::Result {
+    let trace = capture::trace("queue_submit", queue.as_raw(), fence.as_raw(), count, None);
+    let dispatch = cached_trace_dispatch(queue_key(queue), true);
+    let submit = trace_downstream!(dispatch, queue_submit, "vkQueueSubmit", trace);
+    let result = submit(queue, count, submits, fence);
+    if let Some(trace) = trace {
+        trace.finish(result.as_raw());
+    }
+    result
+}
+
+macro_rules! queue_submit2 {
+    ($name:ident, $field:ident, $kind:literal) => {
+        #[no_mangle]
+        pub unsafe extern "system" fn $name(
+            queue: vk::Queue,
+            count: u32,
+            submits: *const vk::SubmitInfo2<'_>,
+            fence: vk::Fence,
+        ) -> vk::Result {
+            let trace = capture::trace($kind, queue.as_raw(), fence.as_raw(), count, None);
+            let dispatch = cached_trace_dispatch(queue_key(queue), true);
+            let submit = trace_downstream!(dispatch, $field, stringify!($name), trace);
+            let result = submit(queue, count, submits, fence);
+            if let Some(trace) = trace {
+                trace.finish(result.as_raw());
+            }
+            result
+        }
+    };
+}
+
+queue_submit2!(vkQueueSubmit2, queue_submit2, "queue_submit2");
+queue_submit2!(vkQueueSubmit2KHR, queue_submit2_khr, "queue_submit2_khr");
+
+#[no_mangle]
+/// Traces and forwards `vkWaitForFences`.
+pub unsafe extern "system" fn vkWaitForFences(
+    device: vk::Device,
+    count: u32,
+    fences: *const vk::Fence,
+    wait_all: vk::Bool32,
+    timeout: u64,
+) -> vk::Result {
+    let first = if capture::is_active() && count > 0 && !fences.is_null() {
+        (*fences).as_raw()
+    } else {
+        0
+    };
+    let trace = capture::trace("wait_fences", device.as_raw(), first, count, Some(timeout));
+    let dispatch = cached_trace_dispatch(key(device), false);
+    let wait = trace_downstream!(dispatch, wait_fences, "vkWaitForFences", trace);
+    let result = wait(device, count, fences, wait_all, timeout);
+    if let Some(trace) = trace {
+        trace.finish(result.as_raw());
+    }
+    result
+}
+
+macro_rules! wait_semaphores {
+    ($name:ident, $field:ident, $kind:literal) => {
+        #[no_mangle]
+        pub unsafe extern "system" fn $name(
+            device: vk::Device,
+            info: *const vk::SemaphoreWaitInfo<'_>,
+            timeout: u64,
+        ) -> vk::Result {
+            let (count, first) = if capture::is_active() && !info.is_null() {
+                let info = &*info;
+                let first = if info.semaphore_count > 0 && !info.p_semaphores.is_null() {
+                    (*info.p_semaphores).as_raw()
+                } else {
+                    0
+                };
+                (info.semaphore_count, first)
+            } else {
+                (0, 0)
+            };
+            let trace = capture::trace($kind, device.as_raw(), first, count, Some(timeout));
+            let dispatch = cached_trace_dispatch(key(device), false);
+            let wait = trace_downstream!(dispatch, $field, stringify!($name), trace);
+            let result = wait(device, info, timeout);
+            if let Some(trace) = trace {
+                trace.finish(result.as_raw());
+            }
+            result
+        }
+    };
+}
+
+wait_semaphores!(vkWaitSemaphores, wait_semaphores, "wait_semaphores");
+wait_semaphores!(
+    vkWaitSemaphoresKHR,
+    wait_semaphores_khr,
+    "wait_semaphores_khr"
+);
+
+#[no_mangle]
+/// Traces and forwards `vkQueueWaitIdle`.
+pub unsafe extern "system" fn vkQueueWaitIdle(queue: vk::Queue) -> vk::Result {
+    let trace = capture::trace("queue_wait_idle", queue.as_raw(), 0, 0, None);
+    let dispatch = cached_trace_dispatch(queue_key(queue), true);
+    let wait = trace_downstream!(dispatch, queue_wait_idle, "vkQueueWaitIdle", trace);
+    let result = wait(queue);
+    if let Some(trace) = trace {
+        trace.finish(result.as_raw());
+    }
+    result
+}
+
+#[no_mangle]
+/// Traces and forwards `vkDeviceWaitIdle`.
+pub unsafe extern "system" fn vkDeviceWaitIdle(device: vk::Device) -> vk::Result {
+    let trace = capture::trace("device_wait_idle", device.as_raw(), 0, 0, None);
+    let dispatch = cached_trace_dispatch(key(device), false);
+    let wait = trace_downstream!(dispatch, device_wait_idle, "vkDeviceWaitIdle", trace);
+    let result = wait(device);
+    if let Some(trace) = trace {
+        trace.finish(result.as_raw());
+    }
+    result
 }
 
 #[no_mangle]
@@ -1275,6 +1931,7 @@ pub unsafe extern "system" fn vkDestroyDevice(
     device: vk::Device,
     allocator: *const vk::AllocationCallbacks<'_>,
 ) {
+    TRACE_DISPATCH_EPOCH.fetch_add(1, Ordering::Release);
     if let Some(state) = devices().lock().remove(&dispatch_key(device)) {
         let (next_gdpa, ash_device, mut swapchains, mut hotkeys) = {
             let mut state = state.lock();
@@ -1289,6 +1946,11 @@ pub unsafe extern "system" fn vkDestroyDevice(
             hotkeys.stop();
         }
         state.lock().telemetry.stop();
+        if let Some(mut calibration) = state.lock().gpu_calibration.take() {
+            calibration.stop();
+        }
+        state.lock().gpu_markers.destroy(&ash_device);
+        state.lock().gpu_overlay_markers.destroy(&ash_device);
         for renderer in swapchains.values_mut() {
             renderer.destroy(&ash_device);
         }
@@ -1300,41 +1962,194 @@ pub unsafe extern "system" fn vkDestroyDevice(
 }
 
 #[no_mangle]
-/// Applies frame pacing, updates metrics, renders the optional overlay, then presents.
+/// Records the overlay and presents with the configured frame-pacing placement.
 pub unsafe extern "system" fn vkQueuePresentKHR(
     queue: vk::Queue,
     present_info: *const vk::PresentInfoKHR<'_>,
 ) -> vk::Result {
-    if present_info.is_null() {
-        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    let trace = capture::trace("present", queue.as_raw(), 0, 0, None);
+    let mut capture = capture::frame(queue_key(queue));
+    let result = queue_present(queue, present_info, &mut capture);
+    if let Some(capture) = capture {
+        capture.finish(result.as_raw());
     }
-    let Some(state) = device_for_queue(queue) else {
-        return vk::Result::ERROR_INITIALIZATION_FAILED;
-    };
-    let (present, ash_device, queue_family, metrics) = {
-        let state = state.lock();
-        (
-            state.next_present,
-            state.ash_device.clone(),
-            state.queue_families.get(&queue_key(queue)).copied(),
-            state.telemetry.current(state.telemetry_expiry),
-        )
-    };
-    let Some(present) = present else {
-        return vk::Result::ERROR_EXTENSION_NOT_PRESENT;
-    };
-    let deadline = {
+    if let Some(trace) = trace {
+        trace.finish(result.as_raw());
+    }
+    result
+}
+
+/// Calls the downstream present, recording its start and end times in the capture frame.
+unsafe fn captured_present(
+    present: vk::PFN_vkQueuePresentKHR,
+    queue: vk::Queue,
+    info: *const vk::PresentInfoKHR<'_>,
+    capture: &mut Option<CaptureFrame>,
+    record_start: impl FnOnce() -> Instant,
+) -> (vk::Result, Instant) {
+    let started = record_start();
+    if let Some(capture) = capture.as_mut() {
+        capture.frame.present_start = Some(started);
+    }
+    let result = present(queue, info);
+    if let Some(capture) = capture.as_mut() {
+        capture.frame.present_end = Some(Instant::now());
+    }
+    (result, started)
+}
+
+/// Waits for the frame-cap deadline, presents, and drops the queue's scheduler if presentation failed.
+unsafe fn paced_present(
+    present: vk::PFN_vkQueuePresentKHR,
+    queue: vk::Queue,
+    info: *const vk::PresentInfoKHR<'_>,
+    capture: &mut Option<CaptureFrame>,
+    state: &Mutex<DeviceState>,
+) -> (vk::Result, Instant) {
+    pace_queue(state, queue, capture);
+    let (result, started) = captured_present(present, queue, info, capture, || {
         let mut state = state.lock();
-        let target_fps = state.frame_cap.target_fps();
-        let deadline = state
+        let started = Instant::now();
+        state
             .schedulers
             .entry(queue_key(queue))
             .or_default()
-            .next_deadline(std::time::Instant::now(), target_fps);
+            .record_present(started);
+        started
+    });
+    if result != vk::Result::SUCCESS && result != vk::Result::SUBOPTIMAL_KHR {
+        state.lock().schedulers.remove(&queue_key(queue));
+    }
+    (result, started)
+}
+
+/// Presents with pacing, then feeds successful presents into the overlay graph, metrics and auto histories.
+unsafe fn captured_present_with_graph(
+    present: vk::PFN_vkQueuePresentKHR,
+    queue: vk::Queue,
+    info: *const vk::PresentInfoKHR<'_>,
+    capture: &mut Option<CaptureFrame>,
+    state: &Arc<Mutex<DeviceState>>,
+    swapchains: &[vk::SwapchainKHR],
+    graph_enabled: bool,
+    metrics: Option<&TelemetrySample>,
+) -> vk::Result {
+    let (result, started) = paced_present(present, queue, info, capture, state);
+    if graph_enabled || metrics.is_some() {
+        let mut state = state.lock();
+        let successful = result == vk::Result::SUCCESS || result == vk::Result::SUBOPTIMAL_KHR;
+        let cap_generation = state.frame_cap.generation();
+        for swapchain in swapchains {
+            if let Some(renderer) = state.swapchains.get_mut(&swapchain.as_raw()) {
+                if graph_enabled {
+                    if successful {
+                        renderer.record_graph_present(started);
+                    } else {
+                        renderer.reset_graph();
+                    }
+                }
+                if let Some(metrics) = metrics.filter(|_| successful) {
+                    let metrics_start = capture.as_ref().map(|_| Instant::now());
+                    let (_, _, refreshed) = renderer.record_present(
+                        started,
+                        metrics.gpu.clone(),
+                        metrics.hardware.clone(),
+                        metrics.hardware_timestamp,
+                        cap_generation,
+                    );
+                    if let (Some(capture), Some(start)) = (capture.as_mut(), metrics_start) {
+                        capture.frame.metrics_ns += elapsed_ns(start);
+                        capture.frame.overlay_refreshes += u32::from(refreshed);
+                    }
+                    let auto_start = capture.as_ref().map(|_| Instant::now());
+                    let windows: Vec<_> = state.auto_regulator.windows().collect();
+                    let histories =
+                        state
+                            .auto_metrics
+                            .entry(swapchain.as_raw())
+                            .or_insert_with(|| {
+                                windows.into_iter().map(AutoMetricsHistory::new).collect()
+                            });
+                    for history in histories.iter_mut() {
+                        history.record(
+                            started,
+                            &metrics.raw_gpu,
+                            &metrics.raw_hardware,
+                            metrics.hardware_timestamp,
+                        );
+                    }
+                    if let (Some(capture), Some(start)) = (capture.as_mut(), auto_start) {
+                        capture.frame.auto_ns += elapsed_ns(start);
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Presents and poisons the GPU marker for the image if presentation failed.
+unsafe fn captured_present_with_marker(
+    present: vk::PFN_vkQueuePresentKHR,
+    queue: vk::Queue,
+    info: *const vk::PresentInfoKHR<'_>,
+    capture: &mut Option<CaptureFrame>,
+    state: &Arc<Mutex<DeviceState>>,
+    swapchains: &[vk::SwapchainKHR],
+    graph_enabled: bool,
+    marker: Option<(u64, u32)>,
+    metrics: Option<&TelemetrySample>,
+) -> vk::Result {
+    let result = captured_present_with_graph(
+        present,
+        queue,
+        info,
+        capture,
+        state,
+        swapchains,
+        graph_enabled,
+        metrics,
+    );
+    if result != vk::Result::SUCCESS && result != vk::Result::SUBOPTIMAL_KHR {
+        if let Some((swapchain, image_index)) = marker {
+            state.lock().gpu_markers.poison(swapchain, image_index);
+            diagnostics::error(format!(
+                "GPU capture presentation failed: result={result:?}; marker disabled for image"
+            ));
+        }
+    }
+    result
+}
+
+/// Sleeps until the queue's next frame-cap deadline, recording scheduling details when capturing.
+fn pace_queue(state: &Mutex<DeviceState>, queue: vk::Queue, capture: &mut Option<CaptureFrame>) {
+    let deadline = {
+        let mut state = state.lock();
+        let target_fps = state.frame_cap.target_fps();
+        let scheduler = state.schedulers.entry(queue_key(queue)).or_default();
+        let now = Instant::now();
+        if let Some(capture) = capture.as_mut() {
+            (
+                capture.frame.previous_target,
+                capture.frame.previous_deadline,
+            ) = scheduler.scheduled_state();
+            capture.frame.schedule_at = Some(now);
+            capture.frame.target = target_fps;
+        }
+        let deadline = scheduler.next_deadline(now, target_fps);
+        if let Some(capture) = capture.as_mut() {
+            capture.frame.deadline = deadline;
+        }
         deadline
     };
     if let Some(deadline) = deadline {
+        if let Some(capture) = capture.as_mut() {
+            capture.frame.wait_start = Some(Instant::now());
+        }
         if let Err(wait_error) = wait_until(deadline) {
+            if let Some(capture) = capture.as_mut() {
+                capture.frame.wait_failed = true;
+            }
             static WAIT_ERROR_LOGGED: AtomicBool = AtomicBool::new(false);
             if !WAIT_ERROR_LOGGED.swap(true, Ordering::Relaxed) {
                 diagnostics::error(format!(
@@ -1343,66 +2158,275 @@ pub unsafe extern "system" fn vkQueuePresentKHR(
             }
         }
     }
+    if let Some(capture) = capture.as_mut() {
+        capture.frame.wake = Some(Instant::now());
+    }
+}
+
+/// Copies present-mode, present-id and Google present-time info from the `pNext` chain into the capture frame.
+unsafe fn capture_present_metadata(info: &vk::PresentInfoKHR<'_>, frame: &mut capture::Frame) {
+    let mut next = info.p_next.cast::<vk::BaseInStructure<'_>>();
+    while let Some(header) = next.as_ref() {
+        match header.s_type {
+            vk::StructureType::SWAPCHAIN_PRESENT_MODE_INFO_EXT => {
+                let modes = &*next.cast::<vk::SwapchainPresentModeInfoEXT<'_>>();
+                if modes.swapchain_count > 0 && !modes.p_present_modes.is_null() {
+                    frame.present_mode_override = Some((*modes.p_present_modes).as_raw());
+                }
+            }
+            vk::StructureType::PRESENT_ID_KHR => {
+                let ids = &*next.cast::<vk::PresentIdKHR<'_>>();
+                if ids.swapchain_count > 0 && !ids.p_present_ids.is_null() {
+                    frame.present_id = Some(*ids.p_present_ids);
+                }
+            }
+            vk::StructureType::PRESENT_TIMES_INFO_GOOGLE => {
+                let times = &*next.cast::<vk::PresentTimesInfoGOOGLE<'_>>();
+                if times.swapchain_count > 0 && !times.p_times.is_null() {
+                    frame.google_present_id = Some((*times.p_times).present_id);
+                }
+            }
+            _ => {}
+        }
+        next = header.p_next;
+    }
+}
+
+/// Core `vkQueuePresentKHR` logic: gathers device state and telemetry, submits GPU markers and presents.
+unsafe fn queue_present(
+    queue: vk::Queue,
+    present_info: *const vk::PresentInfoKHR<'_>,
+    capture: &mut Option<CaptureFrame>,
+) -> vk::Result {
+    if present_info.is_null() {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    }
+    let Some(state) = device_for_queue(queue) else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    if let Some(capture) = capture.as_mut() {
+        capture.frame.lookup_done = Some(Instant::now());
+    }
+    let (present, ash_device, queue_family, metrics, calibration) = {
+        let mut state = state.lock();
+        let ash_device = state.ash_device.clone();
+        state.gpu_markers.poll(&ash_device);
+        state.gpu_overlay_markers.poll(&ash_device);
+        (
+            state.next_present,
+            ash_device,
+            state.queue_families.get(&queue_key(queue)).copied(),
+            state.telemetry.current(state.telemetry_expiry),
+            capture.as_ref().and_then(|_| {
+                state
+                    .gpu_calibration
+                    .as_ref()
+                    .map(CalibrationWorker::current)
+            }),
+        )
+    };
+    let Some(present) = present else {
+        return vk::Result::ERROR_EXTENSION_NOT_PRESENT;
+    };
+    if let Some(capture) = capture.as_mut() {
+        capture.frame.context_done = Some(Instant::now());
+        capture.record_calibration(calibration);
+        if metrics.raw_gpu.status == TelemetryStatus::Available {
+            capture.frame.gpu_load = Some(metrics.raw_gpu.value);
+            capture.frame.gpu_timestamp = Some(metrics.raw_gpu.timestamp);
+        }
+    }
     let info = &*present_info;
+    if let Some(capture) = capture.as_mut() {
+        capture.frame.swapchain_count = info.swapchain_count;
+        capture_present_metadata(info, &mut capture.frame);
+    }
     if info.swapchain_count == 0 || info.p_swapchains.is_null() || info.p_image_indices.is_null() {
-        return present(queue, present_info);
+        return paced_present(present, queue, present_info, capture, &state).0;
     }
     let swapchains = std::slice::from_raw_parts(info.p_swapchains, info.swapchain_count as usize);
     let image_indices =
         std::slice::from_raw_parts(info.p_image_indices, info.swapchain_count as usize);
-    let waits = if info.wait_semaphore_count == 0 || info.p_wait_semaphores.is_null() {
+    if let Some(capture) = capture.as_mut() {
+        capture.associate_acquisition(
+            ash_device.handle().as_raw(),
+            swapchains[0].as_raw(),
+            image_indices[0],
+        );
+    }
+    let mut waits = if info.wait_semaphore_count == 0 || info.p_wait_semaphores.is_null() {
         Vec::new()
     } else {
         std::slice::from_raw_parts(info.p_wait_semaphores, info.wait_semaphore_count as usize)
             .to_vec()
     };
+    let mut marker_key = None;
+    if let Some(capture) = capture.as_mut() {
+        let mut state = state.lock();
+        capture.frame.gpu_marker_status = Some("unsupported");
+        capture.frame.gpu_overlay_marker_status = Some("no_overlay");
+        if let Some(family) = queue_family.filter(|_| {
+            !state.multi_device
+                && !state.protected_queues.contains(&queue_key(queue))
+                && swapchains.len() == 1
+                && !waits.is_empty()
+        }) {
+            capture.frame.gpu_marker_submit_start = Some(Instant::now());
+            let result = state.gpu_markers.submit(
+                &ash_device,
+                queue,
+                family,
+                swapchains[0].as_raw(),
+                image_indices[0],
+                &waits,
+            );
+            capture.frame.gpu_marker_submit_end = Some(Instant::now());
+            match result {
+                Ok(Submission::Submitted(signal, sample)) => {
+                    waits.clear();
+                    waits.push(signal);
+                    marker_key = Some((swapchains[0].as_raw(), image_indices[0]));
+                    capture.frame.gpu_marker = Some(sample);
+                    capture.frame.gpu_marker_status = Some("pending");
+                }
+                Ok(Submission::Skipped(reason)) => {
+                    capture.frame.gpu_marker_status = Some(reason);
+                }
+                Err(error) => {
+                    capture.frame.gpu_marker_status = Some("error");
+                    diagnostics::error(format!("GPU capture marker failed: {error:?}"));
+                    if error == vk::Result::ERROR_DEVICE_LOST {
+                        return error;
+                    }
+                }
+            }
+        }
+    }
+    let mut marker_info = *info;
+    if marker_key.is_some() {
+        marker_info.p_wait_semaphores = waits.as_ptr();
+        marker_info.wait_semaphore_count = waits.len() as u32;
+    }
+    let effective_present_info = if marker_key.is_some() {
+        &marker_info as *const _
+    } else {
+        present_info
+    };
     let mut commands = Vec::new();
     let mut signals = Vec::new();
+    let mut graph_enabled = false;
     if let Some(queue_family) = queue_family {
+        if let Some(capture) = capture.as_mut() {
+            capture.frame.work_lock_start = Some(Instant::now());
+        }
         let mut state = state.lock();
-        let mut cap_generation = state.frame_cap.generation();
+        if let Some(capture) = capture.as_mut() {
+            capture.frame.work_lock_acquired = Some(Instant::now());
+            capture.frame.swapchain = swapchains[0].as_raw();
+            capture.frame.present_mode = state
+                .present_modes
+                .get(&capture.frame.swapchain)
+                .map(|mode| mode.as_raw());
+        }
         let active_mode = state.active_auto_algorithm.load(Ordering::Relaxed);
         let auto_algorithm_index = (active_mode > 0).then_some((active_mode - 1) as usize);
-        state.auto_regulator.set_active(auto_algorithm_index);
         let auto_algorithm_label =
             auto_algorithm_index.and_then(|index| state.auto_regulator.overlay_label(index));
         let auto_target =
             auto_algorithm_index.and_then(|index| state.auto_regulator.overlay_target(index));
+        let target_fps = state.frame_cap.target_fps();
+        let hysteresis = auto_algorithm_index
+            .and_then(|index| state.auto_hysteresis.get(index))
+            .map(|value| f32::from_bits(value.load(Ordering::Relaxed)));
+        let overlay_mode = state.overlay_mode.mode();
+        graph_enabled = overlay_mode == OverlayMode::Full
+            && state.overlay_renderer.current() == crate::layer::settings::OverlayRenderer::Ascii;
+        if let Some(capture) = capture.as_mut() {
+            capture.frame.overlay_mode = Some(overlay_mode as u8);
+            capture.frame.overlay_renderer = Some(match state.overlay_renderer.current() {
+                crate::layer::settings::OverlayRenderer::Ascii => "ascii",
+                crate::layer::settings::OverlayRenderer::Modern => "modern",
+                crate::layer::settings::OverlayRenderer::Helix => "helix",
+            });
+        }
+        for (&swapchain, &image_index) in swapchains.iter().zip(image_indices) {
+            if !graph_enabled {
+                if let Some(renderer) = state.swapchains.get_mut(&swapchain.as_raw()) {
+                    renderer.reset_graph();
+                }
+            }
+            if overlay_mode == OverlayMode::Off {
+                continue;
+            }
+            let overlay_start = capture.as_ref().map(|_| Instant::now());
+            let hotkey_config = state.hotkey_config;
+            let manual_step_fps = state.manual_step_fps;
+            let feedback = state.overlay_feedback.current(Instant::now());
+            let Some(renderer) = state.swapchains.get_mut(&swapchain.as_raw()) else {
+                continue;
+            };
+            let Some(displayed_metrics) = renderer.displayed_metrics() else {
+                continue;
+            };
+            match renderer.record_commands(
+                &ash_device,
+                queue_family,
+                image_index,
+                &displayed_metrics,
+                overlay_mode,
+                target_fps,
+                auto_algorithm_index,
+                auto_algorithm_label,
+                hysteresis,
+                auto_target,
+                hotkey_config,
+                manual_step_fps,
+                feedback,
+            ) {
+                Ok((command, signal)) => {
+                    commands.push(command);
+                    signals.push(signal);
+                }
+                Err(error) => {
+                    static RENDER_ERROR_LOGGED: AtomicBool = AtomicBool::new(false);
+                    if !RENDER_ERROR_LOGGED.swap(true, Ordering::Relaxed) {
+                        diagnostics::error(format!(
+                            "overlay command recording failed: result={error:?}; subsequent render errors suppressed"
+                        ));
+                    }
+                }
+            }
+            if let (Some(capture), Some(start)) = (capture.as_mut(), overlay_start) {
+                capture.frame.overlay_ns += elapsed_ns(start);
+            }
+        }
+    }
+
+    if queue_family.is_some() {
+        if let Some(capture) = capture.as_mut() {
+            capture.frame.metrics_lock_start = Some(Instant::now());
+        }
+        let mut state = state.lock();
+        if let Some(capture) = capture.as_mut() {
+            capture.frame.metrics_lock_acquired = Some(Instant::now());
+        }
+        let active_mode = state.active_auto_algorithm.load(Ordering::Relaxed);
+        let auto_algorithm_index = (active_mode > 0).then_some((active_mode - 1) as usize);
+        state.auto_regulator.set_active(auto_algorithm_index);
         let mut target_fps = state.frame_cap.target_fps();
         let hysteresis = auto_algorithm_index
             .and_then(|index| state.auto_hysteresis.get(index))
             .map(|value| f32::from_bits(value.load(Ordering::Relaxed)));
         let frame_cap = Arc::clone(&state.frame_cap);
-        let overlay_mode = state.overlay_mode.mode();
-        for (&swapchain, &image_index) in swapchains.iter().zip(image_indices) {
-            let Some((_presentation_metrics, displayed_metrics)) = state
-                .swapchains
-                .get_mut(&swapchain.as_raw())
-                .map(|renderer| {
-                    renderer.record_present(
-                        metrics.gpu.clone(),
-                        metrics.hardware.clone(),
-                        metrics.hardware_timestamp,
-                        cap_generation,
-                    )
-                })
-            else {
+        if let Some(capture) = capture.as_mut() {
+            capture.frame.auto_mode = Some(active_mode);
+        }
+        for &swapchain in swapchains {
+            if !state.swapchains.contains_key(&swapchain.as_raw()) {
                 continue;
-            };
-            let evaluation_time = Instant::now();
-            let windows: Vec<_> = state.auto_regulator.windows().collect();
-            let histories = state
-                .auto_metrics
-                .entry(swapchain.as_raw())
-                .or_insert_with(|| windows.into_iter().map(AutoMetricsHistory::new).collect());
-            for history in histories.iter_mut() {
-                history.record(
-                    evaluation_time,
-                    &metrics.raw_gpu,
-                    &metrics.raw_hardware,
-                    metrics.hardware_timestamp,
-                );
             }
+            let auto_start = capture.as_ref().map(|_| Instant::now());
+            let evaluation_time = Instant::now();
             if state.auto_evaluation_schedule.has_gap(evaluation_time) {
                 if let Some(index) = auto_algorithm_index {
                     state.auto_regulator.reset_pending(index);
@@ -1411,6 +2435,11 @@ pub unsafe extern "system" fn vkQueuePresentKHR(
             let evaluation_due = state
                 .auto_evaluation_schedule
                 .should_evaluate(evaluation_time, auto_algorithm_index);
+            if evaluation_due {
+                if let Some(capture) = capture.as_mut() {
+                    capture.frame.auto_evaluations += 1;
+                }
+            }
             if let Some(algorithm_index) = auto_algorithm_index.filter(|_| evaluation_due) {
                 if state.auto_evaluation_swapchain != Some(swapchain.as_raw()) {
                     state.auto_regulator.reset_pending(algorithm_index);
@@ -1439,53 +2468,73 @@ pub unsafe extern "system" fn vkQueuePresentKHR(
                             "[AUTO] FPS limit adjusted: {old:.1} -> {new:.1} fps"
                         ));
                         target_fps = state.frame_cap.target_fps();
-                        cap_generation = state.frame_cap.generation();
                     }
                 } else {
                     state.auto_regulator.reset_pending(algorithm_index);
                 }
             }
-            if overlay_mode != OverlayMode::Off {
-                let hotkey_config = state.hotkey_config;
-                let manual_step_fps = state.manual_step_fps;
-                let feedback = state.overlay_feedback.current(Instant::now());
-                let Some(renderer) = state.swapchains.get_mut(&swapchain.as_raw()) else {
-                    continue;
-                };
-                match renderer.record_commands(
+            if let (Some(capture), Some(start)) = (capture.as_mut(), auto_start) {
+                capture.frame.auto_ns += elapsed_ns(start);
+                capture.frame.target_after = target_fps;
+            }
+        }
+    }
+    if commands.is_empty() && signals.is_empty() {
+        return captured_present_with_marker(
+            present,
+            queue,
+            effective_present_info,
+            capture,
+            &state,
+            swapchains,
+            graph_enabled,
+            marker_key,
+            queue_family.map(|_| &metrics),
+        );
+    }
+
+    let mut overlay_marker = None;
+    if let Some(capture) = capture.as_mut().filter(|_| !commands.is_empty()) {
+        capture.frame.gpu_overlay_marker_status = Some("unsupported");
+        if let Some(family) = queue_family {
+            capture.frame.gpu_overlay_marker_prepare_start = Some(Instant::now());
+            let mut state = state.lock();
+            if !state.multi_device
+                && !state.protected_queues.contains(&queue_key(queue))
+                && swapchains.len() == 1
+            {
+                let result = state.gpu_overlay_markers.prepare_overlay(
                     &ash_device,
-                    queue_family,
-                    image_index,
-                    &displayed_metrics,
-                    overlay_mode,
-                    target_fps,
-                    auto_algorithm_index,
-                    auto_algorithm_label,
-                    hysteresis,
-                    auto_target,
-                    hotkey_config,
-                    manual_step_fps,
-                    feedback,
-                ) {
-                    Ok((command, signal)) => {
-                        commands.push(command);
-                        signals.push(signal);
+                    family,
+                    swapchains[0].as_raw(),
+                    image_indices[0],
+                );
+                match result {
+                    Ok(Preparation::Prepared(prepared)) => {
+                        capture.frame.gpu_overlay_marker = Some(Arc::clone(&prepared.sample));
+                        capture.frame.gpu_overlay_marker_status = Some("pending");
+                        commands.push(prepared.command);
+                        overlay_marker = Some((swapchains[0].as_raw(), image_indices[0], prepared));
+                    }
+                    Ok(Preparation::Skipped(reason)) => {
+                        capture.frame.gpu_overlay_marker_status = Some(reason);
                     }
                     Err(error) => {
-                        static RENDER_ERROR_LOGGED: AtomicBool = AtomicBool::new(false);
-                        if !RENDER_ERROR_LOGGED.swap(true, Ordering::Relaxed) {
-                            diagnostics::error(format!(
-                                "overlay command recording failed: result={error:?}; subsequent render errors suppressed"
-                            ));
+                        capture.frame.gpu_overlay_marker_status = Some("error");
+                        diagnostics::error(format!("GPU overlay capture marker failed: {error:?}"));
+                        if error == vk::Result::ERROR_DEVICE_LOST {
+                            return error;
                         }
                     }
                 }
             }
+            capture.frame.gpu_overlay_marker_prepare_end = Some(Instant::now());
         }
     }
-    if commands.is_empty() {
-        return present(queue, present_info);
-    }
+
+    let submit_fence = overlay_marker
+        .as_ref()
+        .map_or(vk::Fence::null(), |(_, _, marker)| marker.fence);
 
     let wait_stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; waits.len()];
     let submit = [vk::SubmitInfo::default()
@@ -1493,25 +2542,197 @@ pub unsafe extern "system" fn vkQueuePresentKHR(
         .wait_dst_stage_mask(&wait_stages)
         .command_buffers(&commands)
         .signal_semaphores(&signals)];
-    if let Err(error) = ash_device.queue_submit(queue, &submit, vk::Fence::null()) {
+    if let Some(capture) = capture.as_mut() {
+        capture.frame.submit_start = Some(Instant::now());
+    }
+    let submit_result = ash_device.queue_submit(queue, &submit, submit_fence);
+    if let Some(capture) = capture.as_mut() {
+        capture.frame.submit_end = Some(Instant::now());
+        capture.frame.submit_result = Some(match submit_result {
+            Ok(()) => vk::Result::SUCCESS.as_raw(),
+            Err(error) => error.as_raw(),
+        });
+    }
+    if let Err(error) = submit_result {
+        if let Some((swapchain, image_index, _)) = overlay_marker.as_ref() {
+            state
+                .lock()
+                .gpu_overlay_markers
+                .fail(*swapchain, *image_index);
+        }
         static SUBMIT_ERROR_LOGGED: AtomicBool = AtomicBool::new(false);
         if !SUBMIT_ERROR_LOGGED.swap(true, Ordering::Relaxed) {
             diagnostics::error(format!(
                 "overlay queue submission failed: result={error:?}; subsequent submission errors suppressed"
             ));
         }
-        return present(queue, present_info);
+        return captured_present_with_marker(
+            present,
+            queue,
+            effective_present_info,
+            capture,
+            &state,
+            swapchains,
+            graph_enabled,
+            marker_key,
+            queue_family.map(|_| &metrics),
+        );
     }
     let mut modified_info = *info;
     modified_info.p_wait_semaphores = signals.as_ptr();
     modified_info.wait_semaphore_count = signals.len() as u32;
-    present(queue, &modified_info)
+    captured_present_with_marker(
+        present,
+        queue,
+        &modified_info,
+        capture,
+        &state,
+        swapchains,
+        graph_enabled,
+        marker_key,
+        queue_family.map(|_| &metrics),
+    )
+}
+
+/// Returns nanoseconds elapsed since `start`, saturating at `u64::MAX`.
+fn elapsed_ns(start: Instant) -> u64 {
+    start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn trace_interceptors_forward_queue_and_wait_calls() {
+        static SUBMIT_OK: AtomicBool = AtomicBool::new(false);
+        static WAIT_OK: AtomicBool = AtomicBool::new(false);
+        static ALIAS_OK: AtomicBool = AtomicBool::new(false);
+        unsafe extern "system" fn submit(
+            queue: vk::Queue,
+            count: u32,
+            submits: *const vk::SubmitInfo<'_>,
+            fence: vk::Fence,
+        ) -> vk::Result {
+            SUBMIT_OK.store(
+                queue.as_raw() == 41 && count == 3 && submits.is_null() && fence.as_raw() == 11,
+                Ordering::Relaxed,
+            );
+            vk::Result::SUCCESS
+        }
+        unsafe extern "system" fn wait(
+            device: vk::Device,
+            count: u32,
+            fences: *const vk::Fence,
+            wait_all: vk::Bool32,
+            timeout: u64,
+        ) -> vk::Result {
+            WAIT_OK.store(
+                device.as_raw() == 42
+                    && count == 1
+                    && !fences.is_null()
+                    && (*fences).as_raw() == 11
+                    && wait_all == vk::TRUE
+                    && timeout == 123,
+                Ordering::Relaxed,
+            );
+            vk::Result::TIMEOUT
+        }
+        unsafe extern "system" fn submit2(
+            queue: vk::Queue,
+            count: u32,
+            submits: *const vk::SubmitInfo2<'_>,
+            fence: vk::Fence,
+        ) -> vk::Result {
+            ALIAS_OK.store(
+                queue.as_raw() == 41 && count == 2 && submits.is_null() && fence.as_raw() == 11,
+                Ordering::Relaxed,
+            );
+            vk::Result::SUCCESS
+        }
+        let dispatch = TraceDispatch {
+            queue_submit: Some(submit),
+            queue_submit2: None,
+            queue_submit2_khr: Some(submit2),
+            wait_fences: Some(wait),
+            wait_semaphores: None,
+            wait_semaphores_khr: None,
+            queue_wait_idle: None,
+            device_wait_idle: None,
+        };
+        TRACE_DISPATCH_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.epoch = TRACE_DISPATCH_EPOCH.load(Ordering::Acquire);
+            cache.queues.insert(41, dispatch);
+            cache.devices.insert(42, dispatch);
+        });
+        let fence = vk::Fence::from_raw(11);
+        assert_eq!(
+            unsafe { vkQueueSubmit(vk::Queue::from_raw(41), 3, std::ptr::null(), fence) },
+            vk::Result::SUCCESS
+        );
+        assert_eq!(
+            unsafe { vkWaitForFences(vk::Device::from_raw(42), 1, &fence, vk::TRUE, 123) },
+            vk::Result::TIMEOUT
+        );
+        assert_eq!(
+            unsafe { vkQueueSubmit2KHR(vk::Queue::from_raw(41), 2, std::ptr::null(), fence) },
+            vk::Result::SUCCESS
+        );
+        assert!(SUBMIT_OK.load(Ordering::Relaxed));
+        assert!(WAIT_OK.load(Ordering::Relaxed));
+        assert!(ALIAS_OK.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn capture_reads_existing_present_metadata_without_changing_it() {
+        let modes = [vk::PresentModeKHR::MAILBOX];
+        let ids = [42];
+        let times = [vk::PresentTimeGOOGLE::default().present_id(17)];
+        let mut mode = vk::SwapchainPresentModeInfoEXT::default().present_modes(&modes);
+        let mut id = vk::PresentIdKHR::default().present_ids(&ids);
+        let mut timing = vk::PresentTimesInfoGOOGLE::default().times(&times);
+        let info = vk::PresentInfoKHR::default()
+            .push_next(&mut mode)
+            .push_next(&mut id)
+            .push_next(&mut timing);
+        let mut frame = capture::Frame::default();
+        unsafe { capture_present_metadata(&info, &mut frame) };
+        assert_eq!(
+            frame.present_mode_override,
+            Some(vk::PresentModeKHR::MAILBOX.as_raw())
+        );
+        assert_eq!(frame.present_id, Some(42));
+        assert_eq!(frame.google_present_id, Some(17));
+        assert!(!info.p_next.is_null());
+    }
+
+    #[test]
+    fn captured_present_forwards_arguments_and_records_downstream_timing() {
+        unsafe extern "system" fn present(
+            queue: vk::Queue,
+            info: *const vk::PresentInfoKHR<'_>,
+        ) -> vk::Result {
+            assert_eq!(queue.as_raw(), 42);
+            assert!(!info.is_null());
+            vk::Result::SUBOPTIMAL_KHR
+        }
+        let info = vk::PresentInfoKHR::default();
+        let mut capture = Some(CaptureFrame::for_test());
+        let (result, _) = unsafe {
+            captured_present(
+                present,
+                vk::Queue::from_raw(42),
+                &info,
+                &mut capture,
+                Instant::now,
+            )
+        };
+        assert_eq!(result, vk::Result::SUBOPTIMAL_KHR);
+        let frame = &capture.unwrap().frame;
+        assert!(frame.present_start.unwrap() <= frame.present_end.unwrap());
+    }
 
     #[test]
     fn memory_temperature_averages_distinct_samples_and_preserves_lower_bounds() {
@@ -1640,6 +2861,8 @@ mod tests {
             InstanceDispatch {
                 handle: first,
                 next_gipa: test_gipa,
+                calibration_core: true,
+                calibration_properties2: false,
             },
         );
         instances.insert(
@@ -1647,6 +2870,8 @@ mod tests {
             InstanceDispatch {
                 handle: second,
                 next_gipa: test_gipa,
+                calibration_core: true,
+                calibration_properties2: false,
             },
         );
         let physical_device_instances = HashMap::from([(key(physical_device), key(second))]);
@@ -1668,6 +2893,8 @@ mod tests {
             InstanceDispatch {
                 handle: instance,
                 next_gipa: test_gipa,
+                calibration_core: true,
+                calibration_properties2: false,
             },
         )]);
         let physical_device_instances = HashMap::new();
@@ -1684,6 +2911,8 @@ mod tests {
                 InstanceDispatch {
                     handle: instance,
                     next_gipa: test_gipa,
+                    calibration_core: true,
+                    calibration_properties2: false,
                 },
             ),
             (
@@ -1691,6 +2920,8 @@ mod tests {
                 InstanceDispatch {
                     handle: vk::Instance::from_raw(2),
                     next_gipa: test_gipa,
+                    calibration_core: true,
+                    calibration_properties2: false,
                 },
             ),
         ]);

@@ -3,6 +3,7 @@ use crate::layer::telemetry::GpuTelemetryProvider;
 
 use std::time::{Duration, Instant};
 
+/// Collects recent frame durations and combines them with GPU telemetry into snapshots.
 pub struct MetricsAggregator {
     samples: Vec<Duration>,
     window_size: usize,

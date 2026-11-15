@@ -9,11 +9,15 @@ only when requested by the Vulkan loader.
 
 Presentation times are recorded with a monotonic clock per swapchain. The
 observed frame interval is a CPU-side interval between presentations, not GPU
-execution time or a measurement of display scanout. FPS, the 10th percentile
-FPS ("10% low"), and frame-time jitter displayed in the overlay share
-presentation samples over `[overlay].gpu_smoothing_window_ms`. They show
-`COLLECT` after startup or a cap change until a valid interval and the minimum
-collection period are available.
+execution time or a measurement of display scanout. FPS and the 10th percentile
+FPS ("10% low") displayed in the overlay use presentation samples over
+`[overlay].gpu_smoothing_window_ms`. They show `COLLECT` after startup or a cap
+change until a valid interval and the minimum collection period are available.
+The displayed frametime is the latest interval in the refresh-cadenced snapshot,
+without averaging; it shows `COLLECT` until a valid interval is available.
+The ASCII graph and presentation metrics use the same CPU timestamp immediately
+before each successful downstream presentation. The graph updates every frame,
+while the displayed values follow the configured refresh interval.
 
 GPU load and hardware sensors are sampled and smoothed separately for the
 overlay. Automatic regulation keeps separate rolling histories of raw
@@ -27,13 +31,25 @@ Hardware readings can be discovered or configured by hwmon device and label
 or by path. The renderer
 draws the overlay into the application's swapchain with its own Vulkan
 resources; errors are logged and should not unnecessarily stop presentation.
+Vulkan overlay commands for all renderers are recorded before frame pacing,
+using the most recently refreshed presentation metrics. The AUTO decision runs
+before the wait using previously recorded samples; after a successful
+presentation, the overlay and AUTO histories record its start time. A refresh
+becomes available to the overlay on the next presentation. On the first
+presentation no cached metrics exist and overlay command recording starts on
+the next one.
 
 ## FPS control
 
-The limiter uses a monotonic, absolute deadline per presentation queue, once per
-`vkQueuePresentKHR` call even for multiple swapchains. It resets its schedule
-on target changes and avoids catch-up bursts after missed deadlines. The cap
-can be adjusted manually or by one of the
+The limiter tracks the actual CPU start time of the downstream present call per
+queue, once per `vkQueuePresentKHR` call even for multiple swapchains. Before
+each presentation it waits until at least one current target period has elapsed
+since the previous call. Overlay command recording, AUTO evaluation and
+submission occur before this check. A late presentation proceeds without another wait and
+becomes the anchor for the next period; the limiter never catches up to an old
+schedule. Target changes use the most recent presentation as their anchor.
+CPU call timing cannot guarantee GPU completion or physical display timing.
+The cap can be adjusted manually or by one of the
 [automatic algorithms](AUTO-MODE.md), which confirm a persistent direction
 over their configured window; OFF disables the limiter while remembering
 the last target. VSync or an application cap can result in a lower actual FPS.
@@ -64,8 +80,15 @@ the complete Rust source, integration-test, and runtime-resource layout.
 | [`src/layer/telemetry.rs`](../src/layer/telemetry.rs) | GPU telemetry providers, CPU/GPU/hwmon readers, sensor selection, expiration, and time-window smoothing. |
 | [`src/layer/memory_temperature.rs`](../src/layer/memory_temperature.rs) | Reads the BC-250 GDDR6 hotspot from sysfs/hwmon, including saturated readings. |
 | [`src/layer/input_x11.rs`](../src/layer/input_x11.rs) | Process-wide X11/XWayland shortcut listener and dispatch to registered devices. |
-| [`src/layer/renderer.rs`](../src/layer/renderer.rs) | Vulkan swapchain renderer, ASCII and modern overlay layouts, display modes, and transient input feedback. |
-| [`src/layer/dashboard.rs`](../src/layer/dashboard.rs) | Modern dashboard geometry, text glyph rasterization, and rectangle batching; an internal module used by `renderer.rs`. |
+| [`src/layer/renderer/mod.rs`](../src/layer/renderer/mod.rs) | Entry point of the overlay renderer: the `OverlayModel` trait implemented by each visual model, the `OverlayModels` registry that instantiates and dispatches to them, and the per-frame data passed to the active model. |
+| [`src/layer/renderer/swapchain.rs`](../src/layer/renderer/swapchain.rs) | Vulkan swapchain renderer shared by all visual models: render pass, framebuffers, command buffers, image barriers, and presentation metrics history. |
+| [`src/layer/renderer/state.rs`](../src/layer/renderer/state.rs) | Thread-safe display mode, active visual model, and transient input feedback state. |
+| [`src/layer/renderer/pipeline.rs`](../src/layer/renderer/pipeline.rs) | Graphics pipeline and layout creation shared by the models. |
+| [`src/layer/renderer/format.rs`](../src/layer/renderer/format.rs) | Text formatting of metrics, targets, and key hints shared by the models. |
+| [`src/layer/renderer/ascii.rs`](../src/layer/renderer/ascii.rs) | `ascii` visual model: monospaced text layout, bitmap glyphs, and rectangle drawing. |
+| [`src/layer/renderer/modern.rs`](../src/layer/renderer/modern.rs) | `modern` visual model: rounded dashboard layout drawn on a shared canvas. |
+| [`src/layer/renderer/helix.rs`](../src/layer/renderer/helix.rs) | `helix` visual model: flat monospace panel with corner brackets, numbered sections, GTT segment bar and outlined key boxes, drawn on a shared canvas. |
+| [`src/layer/renderer/canvas.rs`](../src/layer/renderer/canvas.rs) | Text glyph rasterization (sans or monospace family), color-grouped rectangle batching and SDF rectangle drawing shared by `modern` and `helix`. |
 | [`src/layer/overlay.rs`](../src/layer/overlay.rs) | Simple text/console rendering of a metrics snapshot, separate from the Vulkan swapchain overlay. |
 | [`src/layer/diagnostics.rs`](../src/layer/diagnostics.rs) | Configurable, synchronized diagnostic logging and process/environment context. |
 
@@ -79,6 +102,7 @@ the complete Rust source, integration-test, and runtime-resource layout.
 | [`src/layer/shaders/overlay_background.vert`](../src/layer/shaders/overlay_background.vert), [`src/layer/shaders/overlay_background.frag`](../src/layer/shaders/overlay_background.frag) | GLSL vertex and fragment shaders for the overlay background. |
 | [`src/layer/shaders/overlay_background.vert.spv`](../src/layer/shaders/overlay_background.vert.spv), [`src/layer/shaders/overlay_background.frag.spv`](../src/layer/shaders/overlay_background.frag.spv) | Checked-in SPIR-V binaries for the overlay-background shaders. |
 | [`src/layer/fonts/FiraSans-Regular.ttf`](../src/layer/fonts/FiraSans-Regular.ttf), [`src/layer/fonts/FiraSans-Bold.ttf`](../src/layer/fonts/FiraSans-Bold.ttf) | Fonts embedded and rasterized by the modern dashboard renderer. |
+| [`src/layer/fonts/FiraMono-Regular.ttf`](../src/layer/fonts/FiraMono-Regular.ttf), [`src/layer/fonts/FiraMono-Bold.ttf`](../src/layer/fonts/FiraMono-Bold.ttf) | Monospace fonts embedded and rasterized by the helix renderer (same SIL OFL family as Fira Sans). |
 | [`src/layer/fonts/OFL.txt`](../src/layer/fonts/OFL.txt) | License for the bundled Fira Sans fonts. |
 
 ### Integration tests

@@ -13,6 +13,7 @@ fn run_vkcube(
     wsi: &str,
     layer_enabled: bool,
     target_fps: Option<&str>,
+    startup_mode: Option<&str>,
     overlay_startup: u8,
     renderer: &str,
     frame_count: u32,
@@ -30,11 +31,15 @@ fn run_vkcube(
         NEXT_LOG_ID.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir(&config_dir).expect("failed to create temporary Framecap config directory");
+    fs::create_dir(config_dir.join(".config")).expect("failed to create user config directory");
     let target_fps = target_fps.unwrap_or("60");
+    let mode_settings = startup_mode
+        .map(|mode| format!("startup_mode = \"{mode}\"\nstartup_algorithm = \"fan_rpm\"\n"))
+        .unwrap_or_default();
     fs::write(
-        config_dir.join("framecap.toml"),
+        config_dir.join(".config/framecap.toml"),
         format!(
-            "[framecap]\nmemory_poll_rate_ms = 0\n\n[manual-mode]\nstartup_fps = {target_fps}\n\n[key-bindings]\ninput_enabled = false\n\n[overlay]\nstartup = {overlay_startup}\nrenderer = \"{renderer}\"\nfps_color = [17, 128, 240]\n\n[diagnostics]\nlog_path = {:?}\n",
+            "[framecap]\nmemory_poll_rate_ms = 0\n\n[manual-mode]\nstartup_fps = {target_fps}\n{mode_settings}\n[key-bindings]\ninput_enabled = false\n\n[overlay]\nstartup = {overlay_startup}\nrenderer = \"{renderer}\"\nfps_color = [17, 128, 240]\n\n[diagnostics]\nlog_path = {:?}\n",
             log_path.display().to_string()
         ),
     )
@@ -43,6 +48,7 @@ fn run_vkcube(
     command
         .args(["20s", "vkcube", "--c", &frame_count, "--wsi", wsi])
         .current_dir(&config_dir)
+        .env("HOME", &config_dir)
         .env("VK_LAYER_PATH", root.join("layer"))
         .env_remove("VK_INSTANCE_LAYERS");
     if layer_enabled {
@@ -57,9 +63,7 @@ fn run_vkcube(
     if log_path.exists() {
         fs::remove_file(&log_path).expect("failed to remove temporary Framecap log");
     }
-    fs::remove_file(config_dir.join("framecap.toml"))
-        .expect("failed to remove temporary Framecap config");
-    fs::remove_dir(&config_dir).expect("failed to remove temporary config directory");
+    fs::remove_dir_all(&config_dir).expect("failed to remove temporary config directory");
     (output, start.elapsed(), diagnostic_log)
 }
 
@@ -86,7 +90,7 @@ fn vkcube_presents_with_and_without_framecap_layer() {
 
     for layer_enabled in [false, true] {
         let (output, _, diagnostic_log) =
-            run_vkcube(root, wsi, layer_enabled, None, 2, "ascii", 60, false);
+            run_vkcube(root, wsi, layer_enabled, None, None, 2, "ascii", 60, false);
         let log = format!(
             "{}\n{}\n{}",
             String::from_utf8_lossy(&output.stdout),
@@ -118,10 +122,10 @@ fn vkcube_presents_with_and_without_framecap_layer() {
         }
     }
 
-    for (renderer, expected) in [("ascii", "Ascii"), ("modern", "Modern")] {
+    for (renderer, expected) in [("ascii", "Ascii"), ("modern", "Modern"), ("helix", "Helix")] {
         for mode in 0..=2 {
             let (output, _, diagnostic_log) =
-                run_vkcube(root, wsi, true, None, mode, renderer, 20, false);
+                run_vkcube(root, wsi, true, None, None, mode, renderer, 20, false);
             assert!(output.status.success(), "mode {mode} failed: {output:?}");
             assert!(
                 diagnostic_log.contains(&format!("overlay_startup={mode}")),
@@ -139,14 +143,41 @@ fn vkcube_presents_with_and_without_framecap_layer() {
         }
     }
 
-    let (uncapped_output, uncapped_time, _) =
-        run_vkcube(root, wsi, true, Some("0"), 2, "ascii", 30, true);
+    let (auto_output, _, auto_log) = run_vkcube(
+        root,
+        wsi,
+        true,
+        Some("60"),
+        Some("auto"),
+        2,
+        "ascii",
+        20,
+        false,
+    );
+    assert!(
+        auto_output.status.success(),
+        "AUTO startup failed: {auto_output:?}"
+    );
+    assert!(auto_log.contains("startup_mode=Automatic(2)"), "{auto_log}");
+
+    let (uncapped_output, uncapped_time, uncapped_log) = run_vkcube(
+        root,
+        wsi,
+        true,
+        Some("30"),
+        Some("off"),
+        2,
+        "ascii",
+        30,
+        true,
+    );
     if !uncapped_output.status.success() {
         eprintln!("Skipping frame-cap timing check: immediate present mode is unavailable");
         return;
     }
+    assert!(uncapped_log.contains("startup_mode=Off"), "{uncapped_log}");
     let (capped_output, capped_time, diagnostic_log) =
-        run_vkcube(root, wsi, true, Some("30"), 2, "ascii", 30, true);
+        run_vkcube(root, wsi, true, Some("30"), None, 2, "ascii", 30, true);
     let capped_log = format!(
         "{}\n{}\n{}",
         String::from_utf8_lossy(&capped_output.stdout),
