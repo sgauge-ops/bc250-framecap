@@ -1,4 +1,4 @@
-//! Text-grid overlay drawn with a built-in 5×7 bitmap font.
+//! Text-grid overlay drawn with a built-in 8×14 bitmap font.
 
 use super::background::BackgroundPreparation;
 use super::canvas::FrameKey;
@@ -18,7 +18,12 @@ const FIRST_COLUMN: usize = 17;
 const SECOND_COLUMN: usize = 36;
 const THIRD_COLUMN: usize = 55;
 const GRAPH_MAX_MS: f32 = 25.0;
-const GRAPH_HEIGHT: u32 = 26;
+/// Width in pixels of one monospace character cell at 1×, including spacing.
+const CHAR_ADVANCE: u32 = 9;
+/// Width in pixels of the glyph grid at 1×.
+const GLYPH_WIDTH: u32 = 8;
+/// Height in pixels of the glyph grid at 1×, equal to the text row height.
+const GLYPH_HEIGHT: u32 = 16;
 
 /// Rolling history of frame times, drawn as a one-pixel-per-sample line graph.
 struct FrametimeGraph {
@@ -28,9 +33,9 @@ struct FrametimeGraph {
 }
 
 impl FrametimeGraph {
-    /// Creates an empty graph whose capacity is the pixel width left of the third column.
+    /// Creates an empty graph with enough history for the widest possible graph cell.
     fn new(extent: vk::Extent2D) -> Self {
-        let left = 8 + (THIRD_COLUMN as u32 + 1) * 6;
+        let left = 8 + (THIRD_COLUMN as u32 + 1) * CHAR_ADVANCE;
         Self {
             last_present: None,
             samples: VecDeque::new(),
@@ -74,13 +79,13 @@ impl FrametimeGraph {
         let left = 8u32.saturating_add(
             (delimiter_column as u32)
                 .saturating_add(1)
-                .saturating_mul(6)
-                .saturating_mul(scale),
+                .saturating_mul(CHAR_ADVANCE * scale),
         );
         let right = background_width.min(extent.width).saturating_sub(8);
         let width = right.saturating_sub(left) as usize;
-        let top = 8;
-        let height = (GRAPH_HEIGHT * scale).min(extent.height.saturating_sub(top));
+        // The cell spans the full first row, from the background's top edge down to the
+        // first separator.
+        let height = (8 + (GLYPH_HEIGHT + 2) * scale).min(extent.height);
         if width == 0 || height == 0 {
             return Vec::new();
         }
@@ -97,7 +102,7 @@ impl FrametimeGraph {
                         vk::Rect2D::default()
                             .offset(vk::Offset2D {
                                 x: (right - 1 - index as u32) as i32,
-                                y: (top + height - 1 - offset) as i32,
+                                y: (height - 1 - offset) as i32,
                             })
                             .extent(vk::Extent2D {
                                 width: 1,
@@ -316,7 +321,7 @@ impl Renderer {
         let Some(start) = text.find(highlighted_text) else {
             return Vec::new();
         };
-        let left = 8u32.saturating_add((start as u32).saturating_mul(6 * scale));
+        let left = 8u32.saturating_add((start as u32).saturating_mul(CHAR_ADVANCE * scale));
         Self::text_rects_at_x(highlighted_text, extent, scale, top, left)
     }
 
@@ -343,7 +348,7 @@ impl Renderer {
         let Some(start) = text.rfind(&value) else {
             return Vec::new();
         };
-        let left = 8u32.saturating_add((start as u32).saturating_mul(6 * scale));
+        let left = 8u32.saturating_add((start as u32).saturating_mul(CHAR_ADVANCE * scale));
         Self::text_rects_at_x(&value, extent, scale, top, left)
     }
 
@@ -371,7 +376,7 @@ impl Renderer {
         let mut rects = Vec::new();
         let mut cursor_x = left;
         for character in text.chars() {
-            if cursor_x + 5 * scale > extent[0].saturating_sub(8) {
+            if cursor_x + GLYPH_WIDTH * scale > extent[0].saturating_sub(8) {
                 break;
             }
             for (row, bits) in glyph(character).iter().copied().enumerate() {
@@ -379,18 +384,26 @@ impl Renderer {
                 if cell_y.saturating_add(scale) > extent[1] {
                     continue;
                 }
-                for column in 0..5 {
-                    if bits & (1 << (4 - column)) != 0 {
-                        rects.push(OverlayRect {
-                            x: cursor_x + column * scale,
-                            y: cell_y,
-                            width: scale,
-                            height: scale,
-                        });
+                // Merge runs of adjacent set pixels into one rectangle per row.
+                let mut column = 0;
+                while column < GLYPH_WIDTH {
+                    if bits & (0x80 >> column) == 0 {
+                        column += 1;
+                        continue;
                     }
+                    let start = column;
+                    while column < GLYPH_WIDTH && bits & (0x80 >> column) != 0 {
+                        column += 1;
+                    }
+                    rects.push(OverlayRect {
+                        x: cursor_x + start * scale,
+                        y: cell_y,
+                        width: (column - start) * scale,
+                        height: scale,
+                    });
                 }
             }
-            cursor_x += 6 * scale;
+            cursor_x += CHAR_ADVANCE * scale;
         }
         rects
     }
@@ -436,9 +449,61 @@ fn append_at_column(text: &mut String, column: usize, segment: &str) {
     text.push_str(segment);
 }
 
+/// Splits a metric row into character runs, flagging the label runs: each field's text up to
+/// and including its colon, plus the `|` column delimiters.
+fn label_segments(text: &str) -> Vec<(usize, String, bool)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut mask = vec![false; chars.len()];
+    let mut field_start = 0;
+    for (index, &character) in chars.iter().enumerate() {
+        match character {
+            '|' => {
+                mask[index] = true;
+                field_start = index + 1;
+            }
+            ':' => {
+                let mut start = field_start;
+                while start < index && chars[start] == ' ' {
+                    start += 1;
+                }
+                for flag in &mut mask[start..=index] {
+                    *flag = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut segments: Vec<(usize, String, bool)> = Vec::new();
+    for (index, (&character, &label)) in chars.iter().zip(&mask).enumerate() {
+        match segments.last_mut() {
+            Some((_, segment, last_label)) if *last_label == label => segment.push(character),
+            _ => segments.push((index, character.to_string(), label)),
+        }
+    }
+    segments
+}
+
+/// Converts a rasterized overlay rectangle into a single-layer Vulkan clear rectangle.
+fn clear_rect(rect: OverlayRect) -> vk::ClearRect {
+    vk::ClearRect::default()
+        .rect(
+            vk::Rect2D::default()
+                .offset(vk::Offset2D {
+                    x: rect.x as i32,
+                    y: rect.y as i32,
+                })
+                .extent(vk::Extent2D {
+                    width: rect.width,
+                    height: rect.height,
+                }),
+        )
+        .base_array_layer(0)
+        .layer_count(1)
+}
+
 /// Computes the top Y of each text row plus separator Y positions; compact mode has one row.
 fn ascii_row_layout(scale: u32, full: bool) -> (u32, u32, u32, u32, u32, Vec<u32>) {
-    let metrics_top = 8 + (GRAPH_HEIGHT - 7) * scale / 2;
+    let metrics_top = 8;
     if !full {
         return (
             metrics_top,
@@ -449,85 +514,133 @@ fn ascii_row_layout(scale: u32, full: bool) -> (u32, u32, u32, u32, u32, Vec<u32
             Vec::new(),
         );
     }
-    let line_step = 7 * scale + 3;
-    let sep1 = metrics_top + (GRAPH_HEIGHT + 2) * scale;
+    let line_step = GLYPH_HEIGHT * scale + 3;
+    let sep1 = metrics_top + (GLYPH_HEIGHT + 2) * scale;
     let status = sep1 + 4 * scale;
-    let sep2 = status + 9 * scale;
+    let sep2 = status + (GLYPH_HEIGHT + 2) * scale;
     let gpu = sep2 + 4 * scale;
     let cpu = gpu + line_step;
     let memory = cpu + line_step;
-    let sep3 = memory + 9 * scale;
+    let sep3 = memory + (GLYPH_HEIGHT + 2) * scale;
     let target = sep3 + 4 * scale;
     (status, gpu, cpu, memory, target, vec![sep1, sep2, sep3])
 }
 
-/// Returns the seven-row bitmap for a supported overlay glyph.
-fn glyph(character: char) -> [u8; 7] {
+/// Returns the fourteen-row 8-pixel-wide bitmap for a supported overlay glyph.
+fn glyph(character: char) -> [u8; 14] {
     match character {
-        '0' => [14, 17, 19, 21, 25, 17, 14],
-        '1' => [4, 12, 4, 4, 4, 4, 14],
-        '2' => [14, 17, 1, 2, 4, 8, 31],
-        '3' => [30, 1, 1, 14, 1, 1, 30],
-        '4' => [2, 6, 10, 18, 31, 2, 2],
-        '5' => [31, 16, 16, 30, 1, 1, 30],
-        '6' => [14, 16, 16, 30, 17, 17, 14],
-        '7' => [31, 1, 2, 4, 8, 8, 8],
-        '8' => [14, 17, 17, 14, 17, 17, 14],
-        '9' => [14, 17, 17, 15, 1, 1, 14],
-        'A' => [14, 17, 17, 31, 17, 17, 17],
-        'B' => [30, 17, 17, 30, 17, 17, 30],
-        'C' => [14, 17, 16, 16, 16, 17, 14],
-        'D' => [30, 17, 17, 17, 17, 17, 30],
-        'E' => [31, 16, 16, 30, 16, 16, 31],
-        'F' => [31, 16, 16, 30, 16, 16, 16],
-        'G' => [14, 17, 16, 23, 17, 17, 15],
-        'H' => [17, 17, 17, 31, 17, 17, 17],
-        'I' => [14, 4, 4, 4, 4, 4, 14],
-        'J' => [7, 2, 2, 2, 2, 18, 12],
-        'K' => [17, 18, 20, 24, 20, 18, 17],
-        'L' => [16, 16, 16, 16, 16, 16, 31],
-        'M' => [17, 27, 21, 21, 17, 17, 17],
-        'N' => [17, 25, 21, 19, 17, 17, 17],
-        'O' => [14, 17, 17, 17, 17, 17, 14],
-        'P' => [30, 17, 17, 30, 16, 16, 16],
-        'Q' => [14, 17, 17, 17, 21, 18, 13],
-        'R' => [30, 17, 17, 30, 20, 18, 17],
-        'S' => [15, 16, 16, 14, 1, 1, 30],
-        'T' => [31, 4, 4, 4, 4, 4, 4],
-        'U' => [17, 17, 17, 17, 17, 17, 14],
-        'V' => [17, 17, 17, 17, 17, 10, 4],
-        'W' => [17, 17, 17, 21, 21, 21, 10],
-        'X' => [17, 17, 10, 4, 10, 17, 17],
-        'Y' => [17, 17, 10, 4, 4, 4, 4],
-        'Z' => [31, 1, 2, 4, 8, 16, 31],
-        '°' => [6, 9, 9, 6, 0, 0, 0],
-        '.' => [0, 0, 0, 0, 0, 12, 12],
-        ':' => [0, 12, 12, 0, 12, 12, 0],
-        '|' => [4, 4, 4, 4, 4, 4, 4],
-        '/' => [1, 1, 2, 4, 8, 16, 16],
-        '-' => [0, 0, 0, 31, 0, 0, 0],
-        '%' => [17, 2, 4, 8, 16, 17, 0],
-        '(' => [2, 4, 8, 8, 8, 4, 2],
-        ')' => [8, 4, 2, 2, 2, 4, 8],
-        '+' => [0, 4, 4, 31, 4, 4, 0],
-        '>' => [16, 8, 4, 2, 4, 8, 16],
-        '=' => [0, 0, 31, 0, 31, 0, 0],
-        '[' => [14, 8, 8, 8, 8, 8, 14],
-        ']' => [14, 2, 2, 2, 2, 2, 14],
-        'a' => [0, 0, 14, 1, 15, 17, 15],
-        'd' => [1, 1, 15, 17, 17, 17, 15],
-        'e' => [0, 0, 14, 17, 31, 16, 14],
-        'f' => [6, 8, 30, 8, 8, 8, 8],
-        'h' => [16, 16, 22, 25, 17, 17, 17],
-        'i' => [4, 0, 12, 4, 4, 4, 14],
-        'o' => [0, 0, 14, 17, 17, 17, 14],
-        'p' => [0, 0, 30, 17, 30, 16, 16],
-        's' => [0, 0, 15, 16, 14, 1, 30],
-        't' => [8, 8, 30, 8, 8, 9, 6],
-        'u' => [0, 0, 17, 17, 17, 19, 13],
-        'w' => [0, 0, 17, 17, 21, 21, 10],
-        'y' => [0, 0, 17, 17, 15, 1, 14],
-        _ => [0; 7],
+        '0' => [
+            124, 198, 198, 198, 198, 214, 214, 198, 198, 198, 198, 124, 0, 0,
+        ],
+        '1' => [24, 56, 120, 24, 24, 24, 24, 24, 24, 24, 24, 126, 0, 0],
+        '2' => [124, 198, 198, 6, 6, 12, 24, 48, 96, 192, 192, 254, 0, 0],
+        '3' => [124, 198, 6, 6, 12, 60, 12, 6, 6, 198, 198, 124, 0, 0],
+        '4' => [12, 28, 60, 108, 204, 204, 254, 12, 12, 12, 12, 12, 0, 0],
+        '5' => [254, 192, 192, 192, 252, 6, 6, 6, 6, 6, 198, 124, 0, 0],
+        '6' => [
+            60, 96, 192, 192, 252, 230, 198, 198, 198, 198, 198, 124, 0, 0,
+        ],
+        '7' => [254, 6, 6, 12, 12, 24, 24, 48, 48, 96, 96, 96, 0, 0],
+        '8' => [
+            124, 198, 198, 198, 124, 198, 198, 198, 198, 198, 198, 124, 0, 0,
+        ],
+        '9' => [124, 198, 198, 198, 198, 198, 126, 6, 6, 6, 12, 120, 0, 0],
+        'A' => [
+            16, 56, 56, 108, 108, 198, 198, 254, 198, 198, 198, 198, 0, 0,
+        ],
+        'B' => [
+            252, 198, 198, 198, 198, 252, 198, 198, 198, 198, 198, 252, 0, 0,
+        ],
+        'C' => [
+            124, 198, 192, 192, 192, 192, 192, 192, 192, 192, 198, 124, 0, 0,
+        ],
+        'D' => [
+            252, 198, 198, 198, 198, 198, 198, 198, 198, 198, 198, 252, 0, 0,
+        ],
+        'E' => [
+            254, 192, 192, 192, 192, 252, 192, 192, 192, 192, 192, 254, 0, 0,
+        ],
+        'F' => [
+            254, 192, 192, 192, 192, 252, 192, 192, 192, 192, 192, 192, 0, 0,
+        ],
+        'G' => [
+            124, 198, 192, 192, 192, 222, 198, 198, 198, 198, 198, 124, 0, 0,
+        ],
+        'H' => [
+            198, 198, 198, 198, 198, 254, 198, 198, 198, 198, 198, 198, 0, 0,
+        ],
+        'I' => [124, 56, 56, 56, 56, 56, 56, 56, 56, 56, 56, 124, 0, 0],
+        'J' => [62, 12, 12, 12, 12, 12, 12, 12, 12, 12, 204, 120, 0, 0],
+        'K' => [
+            198, 204, 216, 240, 224, 224, 240, 216, 204, 198, 198, 198, 0, 0,
+        ],
+        'L' => [
+            192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 254, 0, 0,
+        ],
+        'M' => [
+            198, 238, 254, 214, 214, 198, 198, 198, 198, 198, 198, 198, 0, 0,
+        ],
+        'N' => [
+            198, 230, 230, 214, 214, 206, 206, 198, 198, 198, 198, 198, 0, 0,
+        ],
+        'O' => [
+            124, 198, 198, 198, 198, 198, 198, 198, 198, 198, 198, 124, 0, 0,
+        ],
+        'P' => [
+            252, 198, 198, 198, 198, 252, 192, 192, 192, 192, 192, 192, 0, 0,
+        ],
+        'Q' => [
+            124, 198, 198, 198, 198, 198, 198, 198, 214, 206, 124, 2, 0, 0,
+        ],
+        'R' => [
+            252, 198, 198, 198, 198, 252, 240, 216, 216, 204, 204, 198, 0, 0,
+        ],
+        'S' => [124, 198, 192, 192, 96, 56, 12, 6, 6, 6, 198, 124, 0, 0],
+        'T' => [254, 56, 56, 56, 56, 56, 56, 56, 56, 56, 56, 56, 0, 0],
+        'U' => [
+            198, 198, 198, 198, 198, 198, 198, 198, 198, 198, 198, 124, 0, 0,
+        ],
+        'V' => [
+            198, 198, 198, 198, 198, 198, 108, 108, 108, 56, 56, 16, 0, 0,
+        ],
+        'W' => [
+            198, 198, 198, 198, 198, 214, 214, 214, 214, 254, 238, 198, 0, 0,
+        ],
+        'X' => [198, 198, 108, 108, 56, 56, 56, 56, 108, 108, 198, 198, 0, 0],
+        'Y' => [198, 198, 198, 108, 108, 56, 56, 56, 56, 56, 56, 56, 0, 0],
+        'Z' => [254, 6, 12, 12, 24, 24, 48, 48, 96, 96, 192, 254, 0, 0],
+        '\u{b0}' => [56, 68, 68, 68, 56, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        '.' => [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 48, 48, 0, 0],
+        ':' => [0, 0, 0, 48, 48, 0, 0, 0, 0, 48, 48, 0, 0, 0],
+        '|' => [24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24],
+        '/' => [6, 6, 12, 12, 24, 24, 48, 48, 96, 96, 192, 192, 0, 0],
+        '-' => [0, 0, 0, 0, 0, 124, 124, 0, 0, 0, 0, 0, 0, 0],
+        '%' => [230, 230, 236, 12, 24, 24, 48, 48, 96, 110, 206, 206, 0, 0],
+        '(' => [12, 24, 48, 48, 96, 96, 96, 96, 48, 48, 24, 12, 0, 0],
+        ')' => [96, 48, 24, 24, 12, 12, 12, 12, 24, 24, 48, 96, 0, 0],
+        '+' => [0, 0, 24, 24, 24, 126, 126, 24, 24, 24, 0, 0, 0, 0],
+        '>' => [192, 224, 112, 56, 28, 14, 14, 28, 56, 112, 224, 192, 0, 0],
+        '=' => [0, 0, 0, 126, 126, 0, 0, 126, 126, 0, 0, 0, 0, 0],
+        '[' => [120, 96, 96, 96, 96, 96, 96, 96, 96, 96, 96, 120, 0, 0],
+        ']' => [60, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 60, 0, 0],
+        'a' => [0, 0, 0, 124, 6, 6, 126, 198, 198, 198, 198, 126, 0, 0],
+        'd' => [6, 6, 6, 126, 198, 198, 198, 198, 198, 198, 198, 126, 0, 0],
+        'e' => [0, 0, 0, 124, 198, 198, 254, 192, 192, 192, 198, 124, 0, 0],
+        'f' => [30, 48, 48, 48, 252, 48, 48, 48, 48, 48, 48, 48, 0, 0],
+        'h' => [
+            192, 192, 192, 220, 230, 198, 198, 198, 198, 198, 198, 198, 0, 0,
+        ],
+        'i' => [24, 24, 0, 56, 24, 24, 24, 24, 24, 24, 24, 126, 0, 0],
+        'o' => [0, 0, 0, 124, 198, 198, 198, 198, 198, 198, 198, 124, 0, 0],
+        'p' => [
+            0, 0, 0, 252, 198, 198, 198, 198, 198, 252, 192, 192, 192, 192,
+        ],
+        's' => [0, 0, 0, 124, 198, 192, 120, 60, 6, 6, 198, 124, 0, 0],
+        't' => [0, 48, 48, 252, 48, 48, 48, 48, 48, 48, 48, 30, 0, 0],
+        'u' => [0, 0, 0, 198, 198, 198, 198, 198, 198, 198, 198, 126, 0, 0],
+        'w' => [0, 0, 0, 198, 198, 214, 214, 214, 214, 254, 238, 198, 0, 0],
+        'y' => [0, 0, 0, 198, 198, 198, 198, 198, 198, 198, 198, 126, 6, 120],
+        _ => [0; 14],
     }
 }
 
@@ -592,6 +705,7 @@ struct PreparedAscii {
     background_height: u32,
     delimiter_column: usize,
     separator_rectangles: Vec<vk::ClearRect>,
+    label_rectangles: Vec<vk::ClearRect>,
     metric_rectangles: Vec<vk::ClearRect>,
     fps_rectangles: Vec<vk::ClearRect>,
     frametime_rectangles: Vec<vk::ClearRect>,
@@ -681,11 +795,7 @@ impl AsciiPreparation {
             .unwrap_or_default();
             let scale =
                 overlay_text_scale(self.extent.width, self.scale_2x_min_width_px, widest_line);
-            let metrics_top = if full {
-                8 + (GRAPH_HEIGHT - 7) * scale / 2
-            } else {
-                8
-            };
+            let metrics_top = 8;
             let line_height = scale;
             let (
                 status_top,
@@ -695,11 +805,11 @@ impl AsciiPreparation {
                 target_top,
                 line_tops,
             ) = ascii_row_layout(scale, full);
-            let background_width = (widest_line * 6 * scale + 20).min(self.extent.width);
-            let background_height = (target_top + 7 * scale + 8).min(self.extent.height);
+            let background_width = (widest_line * CHAR_ADVANCE * scale + 20).min(self.extent.width);
+            let background_height = (target_top + GLYPH_HEIGHT * scale + 8).min(self.extent.height);
             let separator_rectangles = if full {
                 let line_width =
-                    (widest_line * 6 * scale).min(self.extent.width.saturating_sub(16));
+                    (widest_line * CHAR_ADVANCE * scale).min(self.extent.width.saturating_sub(16));
                 line_tops
                     .into_iter()
                     .map(|top| {
@@ -723,7 +833,7 @@ impl AsciiPreparation {
                 Vec::new()
             };
 
-            let metric_rectangles = if full {
+            let metric_rows = if full {
                 vec![
                     (&text, metrics_top),
                     (&gpu_sensor_text, gpu_sensor_top),
@@ -732,28 +842,27 @@ impl AsciiPreparation {
                 ]
             } else {
                 vec![(&text, metrics_top)]
+            };
+            let mut metric_rectangles = Vec::new();
+            let mut label_rectangles = Vec::new();
+            for (line, top) in metric_rows {
+                for (start, segment, is_label) in label_segments(line) {
+                    let left = 8 + start as u32 * CHAR_ADVANCE * scale;
+                    let rects = Renderer::text_rects_at_x(
+                        &segment,
+                        [self.extent.width, self.extent.height],
+                        scale,
+                        top,
+                        left,
+                    );
+                    let group = if is_label {
+                        &mut label_rectangles
+                    } else {
+                        &mut metric_rectangles
+                    };
+                    group.extend(rects.into_iter().map(clear_rect));
+                }
             }
-            .into_iter()
-            .flat_map(|(line, top)| {
-                Renderer::text_rects_at(line, [self.extent.width, self.extent.height], scale, top)
-            })
-            .map(|rect| {
-                vk::ClearRect::default()
-                    .rect(
-                        vk::Rect2D::default()
-                            .offset(vk::Offset2D {
-                                x: rect.x as i32,
-                                y: rect.y as i32,
-                            })
-                            .extent(vk::Extent2D {
-                                width: rect.width,
-                                height: rect.height,
-                            }),
-                    )
-                    .base_array_layer(0)
-                    .layer_count(1)
-            })
-            .collect::<Vec<_>>();
             let fps_rectangles = Renderer::fps_value_rects(
                 &text,
                 metrics,
@@ -962,6 +1071,7 @@ impl AsciiPreparation {
                 background_height,
                 delimiter_column: text.chars().count().saturating_sub(1),
                 separator_rectangles,
+                label_rectangles,
                 metric_rectangles,
                 fps_rectangles,
                 frametime_rectangles,
@@ -1092,6 +1202,21 @@ impl OverlayModel for AsciiModel {
                         separator_rectangles,
                     );
                 }
+                if !prepared.label_rectangles.is_empty() {
+                    let label_foreground = [vk::ClearAttachment::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .color_attachment(0)
+                        .clear_value(vk::ClearValue {
+                            color: vk::ClearColorValue {
+                                float32: [0.62, 0.65, 0.68, 1.0],
+                            },
+                        })];
+                    device.cmd_clear_attachments(
+                        command_buffer,
+                        &label_foreground,
+                        &prepared.label_rectangles,
+                    );
+                }
                 if !metric_rectangles.is_empty() {
                     device.cmd_clear_attachments(command_buffer, &foreground, metric_rectangles);
                 }
@@ -1202,7 +1327,12 @@ impl OverlayModel for AsciiModel {
 
 /// Chooses 2× text scale when the extent is wide enough for the widest line, otherwise 1×.
 fn overlay_text_scale(width: u32, minimum_width: u32, widest_line: u32) -> u32 {
-    if width >= minimum_width && widest_line.saturating_mul(12).saturating_add(16) <= width {
+    if width >= minimum_width
+        && widest_line
+            .saturating_mul(CHAR_ADVANCE * 2)
+            .saturating_add(20)
+            <= width
+    {
         2
     } else {
         1
@@ -1323,7 +1453,7 @@ mod tests {
 
     #[test]
     fn frametime_graph_tracks_intervals_and_bounds_history() {
-        let left = 8 + (THIRD_COLUMN as u32 + 1) * 6;
+        let left = 8 + (THIRD_COLUMN as u32 + 1) * 9;
         let mut graph = FrametimeGraph::new(vk::Extent2D {
             width: left + 8 + 3,
             height: 100,
@@ -1359,34 +1489,55 @@ mod tests {
     #[test]
     fn frametime_graph_uses_one_pixel_per_sample_and_clips_at_25_ms() {
         let extent = vk::Extent2D {
-            width: 370,
+            width: 550,
             height: 100,
         };
         let mut graph = FrametimeGraph::new(extent);
         graph.samples.extend([0.0, 12.5, 25.0, 40.0]);
-        let rects = graph.rectangles(extent, 370, THIRD_COLUMN, 1);
+        let rects = graph.rectangles(extent, 550, THIRD_COLUMN, 1);
         let points = rects
             .iter()
             .map(|rect| (rect.rect.offset.x, rect.rect.offset.y))
             .collect::<Vec<_>>();
-        assert_eq!(points, [(361, 8), (360, 8), (359, 20), (358, 33)]);
+        assert_eq!(points, [(541, 0), (540, 0), (539, 11), (538, 23)]);
         assert!(rects
             .iter()
             .all(|rect| rect.rect.extent.width == 1 && rect.rect.extent.height == 1));
 
-        let clipped = graph.rectangles(extent, 355, THIRD_COLUMN, 1);
+        let clipped = graph.rectangles(extent, 523, THIRD_COLUMN, 1);
         assert_eq!(clipped.len(), 3);
+        assert_eq!(clipped.last().unwrap().rect.offset.x, 512);
         let doubled = graph.rectangles(
             vk::Extent2D {
-                width: 800,
+                width: 1200,
                 height: 100,
             },
-            730,
+            1100,
             THIRD_COLUMN,
             2,
         );
-        assert_eq!(doubled[0].rect.offset.y, 8);
-        assert_eq!(doubled[3].rect.offset.y, 59);
+        assert_eq!(doubled[0].rect.offset.y, 0);
+        assert_eq!(doubled[3].rect.offset.y, 39);
+        graph.samples = VecDeque::from(vec![25.0; 100]);
+        let filled = graph.rectangles(extent, 550, THIRD_COLUMN, 1);
+        assert_eq!(filled.len(), 30);
+        assert_eq!(filled.first().unwrap().rect.offset.x, 541);
+        assert_eq!(filled.last().unwrap().rect.offset.x, 512);
+        let shifted = graph.rectangles(extent, 550, THIRD_COLUMN + 1, 1);
+        assert_eq!(shifted.len(), 21);
+        assert_eq!(shifted.last().unwrap().rect.offset.x, 521);
+        let short = graph.rectangles(
+            vk::Extent2D {
+                width: 550,
+                height: 12,
+            },
+            550,
+            THIRD_COLUMN,
+            1,
+        );
+        assert!(short
+            .iter()
+            .all(|rect| rect.rect.offset.y >= 0 && rect.rect.offset.y < 12));
         assert!(graph
             .rectangles(
                 vk::Extent2D {
@@ -1402,7 +1553,7 @@ mod tests {
             .rectangles(
                 vk::Extent2D {
                     width: 370,
-                    height: 8
+                    height: 0
                 },
                 370,
                 THIRD_COLUMN,
@@ -1461,7 +1612,7 @@ mod tests {
         assert!(line
             .chars()
             .filter(|c| !c.is_whitespace())
-            .all(|c| glyph(c) != [0; 7]));
+            .all(|c| glyph(c) != [0; 14]));
 
         let partial = snapshot(HardwareMetrics {
             memory_temp: Some(MemoryTemperature {
@@ -1478,7 +1629,7 @@ mod tests {
         assert!(line
             .chars()
             .filter(|c| !c.is_whitespace())
-            .all(|c| glyph(c) != [0; 7]));
+            .all(|c| glyph(c) != [0; 14]));
         let unavailable = Renderer::memory_sensor_text(&snapshot(HardwareMetrics::default()));
         assert!(unavailable.contains("GDDR6: -- °C"));
         assert!(unavailable.contains("| GTT:    -- /    -- MB"));
@@ -1529,7 +1680,7 @@ mod tests {
                             [1200, 100],
                             scale,
                             25,
-                            8 + column * 6 * scale,
+                            8 + column * 9 * scale,
                         )
                     );
                 }
@@ -1543,6 +1694,8 @@ mod tests {
         assert_eq!(overlay_text_scale(3839, 3840, 100), 1);
         assert_eq!(overlay_text_scale(3840, 3840, 100), 2);
         assert_eq!(overlay_text_scale(3840, 3840, 320), 1);
+        assert_eq!(overlay_text_scale(1819, 0, 100), 1);
+        assert_eq!(overlay_text_scale(1820, 0, 100), 2);
     }
 
     #[test]
@@ -1597,16 +1750,16 @@ mod tests {
         assert!(auto_status
             .chars()
             .filter(|character| !character.is_whitespace())
-            .all(|character| glyph(character) != [0; 7]));
+            .all(|character| glyph(character) != [0; 14]));
         assert!(Renderer::status_text(None, None, None, None, None).contains("CAP:    OFF FPS"));
         let text = target_text(Some(60.0), None);
         assert!(text
             .chars()
             .filter(|character| !character.is_whitespace())
-            .all(|character| glyph(character) != [0; 7]));
+            .all(|character| glyph(character) != [0; 14]));
         let rects = Renderer::text_rects_at(&text, [640, 480], 1, 8);
         assert!(!rects.is_empty());
-        assert!(rects.iter().all(|rect| rect.y >= 8 && rect.y < 15));
+        assert!(rects.iter().all(|rect| rect.y >= 8 && rect.y < 22));
         assert!(rects.iter().all(|rect| rect.x + rect.width <= 632));
 
         let now = Instant::now();
@@ -1673,7 +1826,7 @@ mod tests {
         assert!(gpu_sensors
             .chars()
             .filter(|character| !character.is_whitespace())
-            .all(|character| glyph(character) != [0; 7]));
+            .all(|character| glyph(character) != [0; 14]));
         for (line, marker) in [
             (&manual, "| [F6]"),
             (&status, "| CAP:"),
@@ -1763,7 +1916,7 @@ mod tests {
             assert!(status
                 .chars()
                 .filter(|character| !character.is_whitespace())
-                .all(|character| glyph(character) != [0; 7]));
+                .all(|character| glyph(character) != [0; 14]));
         }
         assert_eq!(
             format_auto_target((AutoMetric::Fps, AutoTarget::Low10Fps), &collecting),
@@ -1811,11 +1964,11 @@ mod tests {
         assert!(text.contains("[F8] CYCLE MODE"));
         assert!(text.contains("[F6]  -2.5 FPS"));
         let highlights = Renderer::feedback_rects(&text, [1200, 100], 1, 8, "[F5]");
-        let f5_start = text.find("[F5]").unwrap() as u32 * 6 + 8;
+        let f5_start = text.find("[F5]").unwrap() as u32 * 9 + 8;
         assert!(!highlights.is_empty());
         assert!(highlights
             .iter()
-            .all(|rect| { rect.x >= f5_start && rect.x + rect.width <= f5_start + 24 }));
+            .all(|rect| { rect.x >= f5_start && rect.x + rect.width <= f5_start + 36 }));
     }
 
     #[test]
@@ -1958,12 +2111,12 @@ mod tests {
         );
         let text = Renderer::text(&metrics);
         let rects = Renderer::frametime_value_rects(&text, &metrics, [800, 600], 1, 8);
-        let expected = 8 + text.rfind("COLLECT").unwrap() as u32 * 6;
+        let expected = 8 + text.rfind("COLLECT").unwrap() as u32 * 9;
         assert!(!rects.is_empty());
         assert!(rects.iter().all(|rect| rect.x >= expected));
         assert!(rects
             .iter()
-            .all(|rect| rect.x < 8 + THIRD_COLUMN as u32 * 6));
+            .all(|rect| rect.x < 8 + THIRD_COLUMN as u32 * 9));
     }
 
     #[test]
@@ -1993,6 +2146,56 @@ mod tests {
     }
 
     #[test]
+    /// Checks that labels and delimiters split from values and cover the whole metric row.
+    fn metric_labels_are_split_from_values_and_delimiters() {
+        let line = "GPU:   43 °C     | VRM:   57 °C     | Load:   55 %     | PPT:  32.6 W";
+        let segments = label_segments(line);
+        let labels: Vec<&str> = segments
+            .iter()
+            .filter(|(_, _, is_label)| *is_label)
+            .map(|(_, segment, _)| segment.as_str())
+            .collect();
+        assert_eq!(labels, ["GPU:", "|", "VRM:", "|", "Load:", "|", "PPT:"]);
+        let values = segments
+            .iter()
+            .filter(|(_, _, is_label)| !is_label)
+            .map(|(_, segment, _)| segment.clone())
+            .collect::<String>();
+        assert!(values.contains("43 °C"));
+        assert!(values.contains("32.6 W"));
+        // The split segments rasterize to exactly the same pixels as the whole row.
+        let mut split: Vec<OverlayRect> = segments
+            .iter()
+            .flat_map(|(start, segment, _)| {
+                Renderer::text_rects_at_x(
+                    segment,
+                    [1200, 100],
+                    1,
+                    8,
+                    8 + *start as u32 * CHAR_ADVANCE,
+                )
+            })
+            .collect();
+        let mut whole = Renderer::text_rects_at(line, [1200, 100], 1, 8);
+        let key = |rect: &OverlayRect| (rect.y, rect.x, rect.width, rect.height);
+        split.sort_by_key(key);
+        whole.sort_by_key(key);
+        assert_eq!(split, whole);
+        // The metrics row's trailing delimiter is a label; the FPS-only row has no labels.
+        let metrics_row_segments =
+            label_segments("FPS:   60        | 10% LOW: 55 FPS  | FT: 16.00 MS     |");
+        let metric_labels: Vec<&str> = metrics_row_segments
+            .iter()
+            .filter(|(_, _, is_label)| *is_label)
+            .map(|(_, segment, _)| segment.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(metric_labels, ["FPS:", "|", "10% LOW:", "|", "FT:", "|"]);
+        assert!(label_segments("   60 FPS")
+            .iter()
+            .all(|(_, _, is_label)| !is_label));
+    }
+
+    #[test]
     /// Checks fixed text widths for metric and target columns.
     fn metric_and_target_columns_keep_fixed_text_widths() {
         let now = Instant::now();
@@ -2015,13 +2218,38 @@ mod tests {
     }
 
     #[test]
+    fn bitmap_font_uses_a_uniform_8x14_grid() {
+        for scale in [1u32, 2] {
+            let rects = Renderer::text_rects("HH", [200, 100], scale);
+            assert!(!rects.is_empty());
+            // Uniform pixels: every rectangle is a whole number of scaled columns and one
+            // scaled row tall.
+            assert!(rects
+                .iter()
+                .all(|rect| rect.width % scale == 0 && rect.height == scale));
+            // 'H' spans glyph columns 0-6 and rows 0-11; the second 'H' starts one
+            // 9-pixel advance to the right.
+            assert_eq!(rects.iter().map(|rect| rect.x).min(), Some(8));
+            assert_eq!(
+                rects.iter().map(|rect| rect.x + rect.width).max(),
+                Some(8 + (CHAR_ADVANCE + 7) * scale)
+            );
+            assert_eq!(rects.iter().map(|rect| rect.y).min(), Some(8));
+            assert_eq!(
+                rects.iter().map(|rect| rect.y + rect.height).max(),
+                Some(8 + 12 * scale)
+            );
+        }
+    }
+
+    #[test]
     /// Checks clipping of generated text rectangles to the swapchain extent.
     fn text_rects_clip_to_swapchain_extent() {
         let rects = Renderer::text_rects("FRAMECAP", [64, 32], 2);
         assert!(!rects.is_empty());
         assert!(rects.iter().all(|rect| rect.x + rect.width <= 64));
         assert!(rects.iter().all(|rect| rect.y + rect.height <= 32));
-        let bottom_clipped = Renderer::text_rects_at("FRAMECAP", [64, 20], 2, 18);
+        let bottom_clipped = Renderer::text_rects_at("FRAMECAP", [64, 20], 2, 17);
         assert!(!bottom_clipped.is_empty());
         assert!(bottom_clipped.iter().all(|rect| rect.y + rect.height <= 20));
         assert!(Renderer::text_rects("FRAMECAP", [8, 8], 2).is_empty());
@@ -2044,18 +2272,21 @@ mod tests {
             let [sep1_top, sep2_top, sep3_top] = separators.as_slice() else {
                 panic!("expected three separators")
             };
-            let background_height = target_top + 7 * scale + 8;
+            let text_height = GLYPH_HEIGHT * scale;
+            let background_height = target_top + text_height + 8;
 
-            assert!(8 + GRAPH_HEIGHT * scale < *sep1_top);
-            assert!(metrics_top + 7 * scale < *sep1_top);
+            assert_eq!(*sep1_top - metrics_top, *sep2_top - status_top);
+            assert_eq!(*sep1_top - metrics_top, *sep3_top - memory_sensor_top);
+            assert_eq!(ascii_row_layout(scale, false).4, metrics_top);
+            assert!(metrics_top + text_height < *sep1_top);
             assert!(*sep1_top + line_height < status_top);
-            assert!(status_top + 7 * scale < *sep2_top);
+            assert!(status_top + text_height < *sep2_top);
             assert!(*sep2_top + line_height < gpu_sensor_top);
-            assert!(gpu_sensor_top + 7 * scale < cpu_sensor_top);
-            assert!(cpu_sensor_top + 7 * scale < memory_sensor_top);
-            assert!(memory_sensor_top + 7 * scale < *sep3_top);
+            assert!(gpu_sensor_top + text_height < cpu_sensor_top);
+            assert!(cpu_sensor_top + text_height < memory_sensor_top);
+            assert!(memory_sensor_top + text_height < *sep3_top);
             assert!(*sep3_top + line_height < target_top);
-            assert!(target_top + 7 * scale < background_height);
+            assert!(target_top + text_height < background_height);
         }
     }
 }

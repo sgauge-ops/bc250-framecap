@@ -45,6 +45,9 @@ in addition to any background preparation delay.
 An unknown renderer name rejects the configuration file. The configured
 renderer is selected at application startup.
 
+The ASCII overlay uses a built-in 8×14 bitmap font with a 9-pixel character
+advance at 1× (18 pixels at 2×). The 2× mode uses the configured width
+threshold and requires the enlarged layout to fit.
 The ascii overlay presents:
 
 ```text
@@ -101,6 +104,9 @@ both visible modes. `[overlay].fps_color` sets its color as three RGB integers
 from 0 to 255, for example `[255, 255, 0]`. Other text keeps its usual colors.
 An invalid RGB array rejects the configuration file, as with other invalid TOML
 types.
+In the ASCII overlay's metric and sensor rows, the labels (each field up to and
+including its colon) and the `|` column delimiters are gray; values and their
+units stay white. The status and key-hint rows keep their cyan color.
 
 Columns are aligned across lines: F6/CAP/10% LOW/VRM, F7/HYS/FT/Load,
 and F8/TARGET/PPT/RPM. In the full overlay, FPS is shown as `FPS: value`;
@@ -118,7 +124,10 @@ adjustment step.
 The full ASCII overlay also plots frametime in the empty cell to
 the right of `FT`. Each physical pixel represents one interval, with the
 newest at the right. The vertical scale is 0–25 ms; larger values are clipped
-to the top. The first row is taller to provide a 26-pixel-high graph at 1×.
+to the top. The graph fills its cell: the available width right of the `FT`
+column and the full cell height, from the background's top edge down to the
+first separator (24 pixels at 1×, 40 pixels at 2×); the first row has the same
+height as the other text rows.
 Each sample is the CPU interval between calls immediately before the downstream
 Vulkan presentation.
 The graph updates on every presentation, independently of

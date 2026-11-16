@@ -8,6 +8,7 @@ changes, not necessarily when development originally took place.
 
 | Date | Changes |
 | --- | --- |
+| 2026-11-16 | Replace the ASCII renderer's 5×7 bitmap font with a larger built-in 8×14 font and fit its frametime graph to the available cell width and the full first-row cell height. Put labels in gray. |
 | 2026-11-15 | Record bounded per-thread Vulkan submission, synchronization, acquisition and presentation traces during frametime capture. |
 | 2026-11-15 | Add an opt-in experimental post-presentation frame-cap wait and record its placement in frametime captures. |
 | 2026-11-15 | Calibrate GPU marker timestamps against the CPU monotonic clock asynchronously during frametime capture when Vulkan support is available. |
