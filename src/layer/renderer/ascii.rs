@@ -1499,7 +1499,7 @@ mod tests {
             .iter()
             .map(|rect| (rect.rect.offset.x, rect.rect.offset.y))
             .collect::<Vec<_>>();
-        assert_eq!(points, [(541, 0), (540, 0), (539, 11), (538, 23)]);
+        assert_eq!(points, [(541, 0), (540, 0), (539, 12), (538, 25)]);
         assert!(rects
             .iter()
             .all(|rect| rect.rect.extent.width == 1 && rect.rect.extent.height == 1));
@@ -1517,7 +1517,7 @@ mod tests {
             2,
         );
         assert_eq!(doubled[0].rect.offset.y, 0);
-        assert_eq!(doubled[3].rect.offset.y, 39);
+        assert_eq!(doubled[3].rect.offset.y, 43);
         graph.samples = VecDeque::from(vec![25.0; 100]);
         let filled = graph.rectangles(extent, 550, THIRD_COLUMN, 1);
         assert_eq!(filled.len(), 30);

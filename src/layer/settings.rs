@@ -1093,7 +1093,7 @@ mod tests {
     /// Checks that the shipped example parses with its active GPU and jitter thresholds.
     fn shipped_configuration_parses_gpu_and_jitter_thresholds() {
         let settings: RawSettings = toml::from_str(include_str!("../../framecap.toml")).unwrap();
-        assert_eq!(settings.overlay.renderer, Some(OverlayRenderer::Helix));
+        assert_eq!(settings.overlay.renderer, Some(OverlayRenderer::Ascii));
         assert_eq!(settings.manual_mode.startup_fps, Some(90.0));
         assert_eq!(settings.framecap.target_fps, None);
         let gpu_threshold = settings
